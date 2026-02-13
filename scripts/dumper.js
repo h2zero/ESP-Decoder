@@ -10,7 +10,7 @@ import { FQBN, valid } from 'fqbn'
 import multer from 'multer'
 import { exec } from 'tinyexec'
 
-import { setupTestEnv } from './env/env.js'
+import { compileWithTestEnv, setupTestEnv } from './env/env.js'
 import { projectRootPath } from './utils.js'
 
 const WIFI_SSID = /** @type {string} */ (process.env.WIFI_SSID)
@@ -29,7 +29,7 @@ const templatesPath = path.join(projectRootPath, '.tests/templates')
 const testProjectName = 'Dumper'
 const placeholderVersion = '0.0.0'
 
-/** @typedef {Awaited<ReturnType<typeof setupTestEnv>>} TestEnv */
+/** @typedef {import('./env/env.js').TestEnv} TestEnv */
 
 /**
  * @typedef {Object} CreateDumpParams
@@ -49,9 +49,9 @@ const placeholderVersion = '0.0.0'
  * @param {TestEnv} testEnv
  */
 async function createDumps(params, testEnv) {
-  const { cliContext, toolsEnvs } = testEnv
+  const { cliContext, toolEnvs } = testEnv
   const arduinoCliPath = cliContext.cliPath
-  const arduinoCliConfigPath = toolsEnvs['cli'].cliConfigPath
+  const arduinoCliConfigPath = toolEnvs['cli'].cliConfigPath
 
   const { recordDump, crashDumpEndpoint } = await startDumpServer({
     dumpsOutputFolderPath: coredumpsPath,
@@ -67,21 +67,24 @@ async function createDumps(params, testEnv) {
 
     // Create a sketch from the template
     console.log(`Creating sketch for board: ${fqbn}...`)
-    const sketchFolderPath = await createSketch({
+    const sketchPath = await createSketch({
       boardParams,
       sketchFolderTemplatePath: path.join(templatesPath, testProjectName),
       crashDumpEndpoint,
     })
-    console.log(`Sketch created at: ${sketchFolderPath}`)
+    console.log(`Sketch created at: ${sketchPath}`)
 
     // Compile the sketch for the board
     console.log(`Compiling sketch for board: ${fqbn}...`)
-    const compileSummary = await compileSketch(
-      arduinoCliPath,
-      arduinoCliConfigPath,
-      boardParams.fqbn,
-      sketchFolderPath
-    )
+    const compileSummary = await compileWithTestEnv({
+      testEnv,
+      sketchPath,
+      fqbn: boardParams.fqbn,
+      buildProperties: [
+        `compiler.c.extra_flags=${COREDUMP_FLAGS}`,
+        `compiler.cpp.extra_flags=${COREDUMP_FLAGS}`,
+      ],
+    })
     console.log(`Compiled sketch for board: ${fqbn}`)
 
     // Copy the firmware ELF file to the coredumps folder
@@ -114,7 +117,7 @@ async function createDumps(params, testEnv) {
       arduinoCliConfigPath,
       fqbn.toString(),
       boardParams.port,
-      sketchFolderPath
+      sketchPath
     )
     console.log(
       `Sketch uploaded to board: ${fqbn} on port: ${boardParams.port}`
@@ -148,18 +151,22 @@ async function createDumps(params, testEnv) {
       fqbn.boardId,
       'read_flash-dump.raw'
     )
-    await exec(esptoolPath, [
-      '--chip',
-      boardParams.chip,
-      '--port',
-      boardParams.port,
-      '--baud',
-      '115200',
-      'read_flash',
-      '0x3F0000',
-      '0x10000',
-      rawPartitionPath,
-    ])
+    await exec(
+      esptoolPath,
+      [
+        '--chip',
+        boardParams.chip,
+        '--port',
+        boardParams.port,
+        '--baud',
+        '115200',
+        'read_flash',
+        '0x3F0000',
+        '0x10000',
+        rawPartitionPath,
+      ],
+      { throwOnError: true }
+    )
     console.log(
       `Raw flash partition read for board ${fqbn} saved to: ${rawPartitionPath}`
     )
@@ -181,7 +188,9 @@ async function createDumps(params, testEnv) {
     )
     const bashCommand = `. "${espIdfExport}" && ${pipxCommand}`
 
-    const { stdout, stderr } = await exec('bash', ['-c', bashCommand])
+    const { stdout, stderr } = await exec('bash', ['-c', bashCommand], {
+      throwOnError: true,
+    })
     if (stderr) {
       console.error(`Error reading coredump: ${stderr}`)
     } else {
@@ -191,13 +200,13 @@ async function createDumps(params, testEnv) {
     console.log(stdout)
 
     await fs
-      .rm(sketchFolderPath, {
+      .rm(sketchPath, {
         force: true,
         recursive: true,
         maxRetries: 3,
       })
       .catch((err) =>
-        console.warn(`Failed to remove sketch folder ${sketchFolderPath}:`, err)
+        console.warn(`Failed to remove sketch folder ${sketchPath}:`, err)
       )
   }
 
@@ -264,49 +273,27 @@ const COREDUMP_FLAGS = [
  * @param {string} cliPath
  * @param {string} cliConfigPath
  * @param {string} fqbn
- * @param {string} sketchPath
- * @returns {Promise<any>}
- */
-async function compileSketch(cliPath, cliConfigPath, fqbn, sketchPath) {
-  const { stdout } = await exec(cliPath, [
-    'compile',
-    sketchPath,
-    '-b',
-    fqbn,
-    '--build-property',
-    `compiler.c.extra_flags=${COREDUMP_FLAGS}`,
-    '--build-property',
-    `compiler.cpp.extra_flags=${COREDUMP_FLAGS}`,
-    '--config-file',
-    cliConfigPath,
-    '--format',
-    'json',
-  ])
-
-  return JSON.parse(stdout)
-}
-
-/**
- * @param {string} cliPath
- * @param {string} cliConfigPath
- * @param {string} fqbn
  * @param {string} port
  * @param {string} sketchPath
  * @returns {Promise<void>}
  */
 async function uploadSketch(cliPath, cliConfigPath, fqbn, port, sketchPath) {
-  await exec(cliPath, [
-    'upload',
-    sketchPath,
-    '-b',
-    fqbn,
-    '-p',
-    port,
-    '--config-file',
-    cliConfigPath,
-    '--format',
-    'json',
-  ])
+  await exec(
+    cliPath,
+    [
+      'upload',
+      sketchPath,
+      '-b',
+      fqbn,
+      '-p',
+      port,
+      '--config-file',
+      cliConfigPath,
+      '--format',
+      'json',
+    ],
+    { throwOnError: true }
+  )
 }
 
 /**
@@ -353,6 +340,7 @@ async function startDumpServer(startParams) {
 
   function getHostAddress() {
     const nets = os.networkInterfaces() || {}
+    /** @type {Record<string, string[]>} */
     const results = {}
 
     for (const name of Object.keys(nets)) {
@@ -418,7 +406,7 @@ async function startDumpServer(startParams) {
     try {
       params = checkParams(req)
     } catch (err) {
-      res.status(400).send(err.message)
+      res.status(400).send(err instanceof Error ? err.message : String(err))
       return
     }
 
