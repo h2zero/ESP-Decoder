@@ -1,0 +1,154 @@
+{
+  "name": "esp-decoder",
+  "displayName": "ESP Decoder",
+  "description": "Decode ESP32/ESP8266 crash dumps from serial port — powered by TraceBreaker (trbr). Works with PlatformIO and pioarduino.",
+  "version": "0.1.0",
+  "publisher": "Jason2866",
+  "license": "GPL-3.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "keywords": [
+    "esp32",
+    "esp8266",
+    "crash",
+    "backtrace",
+    "decode",
+    "platformio",
+    "pioarduino",
+    "serial",
+    "xtensa",
+    "riscv",
+    "trbr"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "esp-decoder.openMonitor",
+        "title": "ESP Decoder: Open Serial Monitor & Crash Decoder",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "esp-decoder.selectPort",
+        "title": "ESP Decoder: Select Serial Port"
+      },
+      {
+        "command": "esp-decoder.selectBaudRate",
+        "title": "ESP Decoder: Select Baud Rate"
+      },
+      {
+        "command": "esp-decoder.connect",
+        "title": "ESP Decoder: Connect Serial Port"
+      },
+      {
+        "command": "esp-decoder.disconnect",
+        "title": "ESP Decoder: Disconnect Serial Port"
+      },
+      {
+        "command": "esp-decoder.selectElfFile",
+        "title": "ESP Decoder: Select ELF File"
+      },
+      {
+        "command": "esp-decoder.clearOutput",
+        "title": "ESP Decoder: Clear Output"
+      }
+    ],
+    "configuration": {
+      "title": "ESP Decoder",
+      "properties": {
+        "esp-decoder.defaultBaudRate": {
+          "type": "number",
+          "default": 115200,
+          "description": "Default baud rate for serial connections",
+          "enum": [
+            9600,
+            19200,
+            38400,
+            57600,
+            74880,
+            115200,
+            230400,
+            460800,
+            921600
+          ]
+        },
+        "esp-decoder.autoDetectElf": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically detect ELF file from PlatformIO build directory"
+        },
+        "esp-decoder.elfPath": {
+          "type": "string",
+          "default": "",
+          "description": "Manual path to ELF file (overrides auto-detection)"
+        },
+        "esp-decoder.toolPath": {
+          "type": "string",
+          "default": "",
+          "description": "Manual path to GDB/addr2line tool (overrides auto-detection)"
+        },
+        "esp-decoder.targetArch": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "xtensa",
+            "riscv32"
+          ],
+          "description": "Target architecture for decoding (auto will try to detect from ELF)"
+        },
+        "esp-decoder.serialMonitor.maxLines": {
+          "type": "number",
+          "default": 5000,
+          "description": "Maximum number of lines to keep in serial monitor"
+        },
+        "esp-decoder.serialMonitor.autoscroll": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically scroll to bottom on new serial data"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "esp-decoder-sidebar",
+          "title": "ESP Decoder",
+          "icon": "$(bug)"
+        }
+      ]
+    },
+    "views": {
+      "esp-decoder-sidebar": [
+        {
+          "type": "webview",
+          "id": "esp-decoder.sidebarView",
+          "name": "Crash Events"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js --production",
+    "watch": "node esbuild.js --watch",
+    "package": "npx @vscode/vsce package --no-dependencies",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "serialport": "^12.0.0",
+    "trbr": "^0.3.1"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}
