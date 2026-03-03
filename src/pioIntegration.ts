@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import * as childProcess from 'child_process';
 
 /**
  * Detected PlatformIO environment with ELF and tool paths.
@@ -66,7 +65,7 @@ async function detectToolFromPioEnv(
   workspaceFolder: string,
   envName: string
 ): Promise<DetectedTool | undefined> {
-  // First, determine the target arch from platformio.ini board info
+  // Determine the target arch from platformio.ini board info
   let board: string | undefined;
   let platform: string | undefined;
 
@@ -80,7 +79,7 @@ async function detectToolFromPioEnv(
     }
   }
 
-  // Determine target arch from board JSON (MCU) or board/env name
+  // Determine target arch from board JSON (MCU)
   const targetArch = getChipTarget(board || envName, workspaceFolder);
   const isRiscV = isRiscVArch(targetArch);
 
@@ -92,38 +91,16 @@ async function detectToolFromPioEnv(
       return { toolPath, targetArch };
     }
   }
-
-  // Fallback: try idedata.json cc_path directory — validate tool matches expected arch
-  const ideDataPath = path.join(workspaceFolder, '.pio', 'build', envName, 'idedata.json');
-  if (fs.existsSync(ideDataPath)) {
-    try {
-      const ideData = JSON.parse(fs.readFileSync(ideDataPath, 'utf8'));
-      if (ideData.cc_path) {
-        const toolDir = path.dirname(ideData.cc_path);
-        const toolPath = findGdbInDir(toolDir);
-        if (toolPath) {
-          const toolIsRiscV = /riscv|risc-v/i.test(path.basename(toolPath));
-          if (toolIsRiscV === isRiscV) {
-            return { toolPath, targetArch };
-          }
-        }
-      }
-    } catch {
-      // ignore parse errors
-    }
-  }
-
   return undefined;
 }
 
 /**
- * Get PlatformIO core directory (~/.platformio or ~/.pioarduino).
+ * Get PlatformIO core directory (~/.platformio).
  */
 function getPioCoreDir(): string | undefined {
   const homeDir = os.homedir();
   const candidates = [
     path.join(homeDir, '.platformio'),
-    path.join(homeDir, '.pioarduino'),
   ];
 
   for (const dir of candidates) {
@@ -192,7 +169,6 @@ const RISCV_TARGETS = new Set(['esp32c2', 'esp32c3', 'esp32c5', 'esp32c6', 'esp3
  * Determine the chip name (trbr target arch) from a board name by reading its
  * board JSON from PlatformIO's boards directories.
  *
- * Falls back to matching against the board/env name directly.
  * Longest chip keys are compared first so that "esp32s3" is not confused with "esp32".
  */
 function getChipTarget(boardName: string | undefined, workspaceFolder?: string): string {
@@ -207,14 +183,6 @@ function getChipTarget(boardName: string | undefined, workspaceFolder?: string):
         if (mcuNorm.includes(key)) {
           return CHIP_TARGET_MAP[key];
         }
-      }
-    }
-
-    // Fallback: match against the board name itself
-    const boardNorm = boardName.toLowerCase().replace(/[-_]/g, '');
-    for (const key of sortedKeys) {
-      if (boardNorm.includes(key)) {
-        return CHIP_TARGET_MAP[key];
       }
     }
   }
@@ -279,28 +247,6 @@ function isRiscVArch(targetArch: string): boolean {
 }
 
 /**
- * Find GDB executable in a directory.
- */
-function findGdbInDir(dir: string): string | undefined {
-  if (!fs.existsSync(dir)) {
-    return undefined;
-  }
-
-  try {
-    const files = fs.readdirSync(dir);
-    const gdbFile = files.find(
-      (f) => f.includes('gdb') && !f.endsWith('.py') && !f.endsWith('.txt')
-    );
-    if (gdbFile) {
-      return path.join(dir, gdbFile);
-    }
-  } catch {
-    // ignore
-  }
-  return undefined;
-}
-
-/**
  * Find GDB binary from PlatformIO tool packages by well-known package name.
  * Looks for: tool-riscv32-esp-elf-gdb / tool-xtensa-esp-elf-gdb
  * with binary: riscv32-esp-elf-gdb / xtensa-esp32-elf-gdb (+ .exe on Windows)
@@ -315,44 +261,11 @@ function findGdbPackage(packagesDir: string, isRiscV: boolean): string | undefin
       return gdbBin;
     }
   } else {
-    // Xtensa: try the dedicated GDB tool package first
     const gdbBin = path.join(packagesDir, 'tool-xtensa-esp-elf-gdb', 'bin', 'xtensa-esp32-elf-gdb' + ext);
     if (fs.existsSync(gdbBin)) {
       return gdbBin;
     }
-    // Fallback: try xtensa-esp-elf-gdb package with generic binary name
-    const gdbBinAlt = path.join(packagesDir, 'tool-xtensa-esp-elf-gdb', 'bin');
-    const found = findGdbInDir(gdbBinAlt);
-    if (found) {
-      return found;
-    }
   }
-
-  // Last resort: scan all tool-*gdb* packages
-  try {
-    const entries = fs.readdirSync(packagesDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) {
-        continue;
-      }
-      const pkgName = entry.name.toLowerCase();
-      if (!pkgName.startsWith('tool-') || !pkgName.includes('gdb')) {
-        continue;
-      }
-      const pkgIsRiscV = pkgName.includes('riscv') || pkgName.includes('risc-v');
-      if (pkgIsRiscV !== isRiscV) {
-        continue;
-      }
-      const binDir = path.join(packagesDir, entry.name, 'bin');
-      const toolPath = findGdbInDir(binDir);
-      if (toolPath) {
-        return toolPath;
-      }
-    }
-  } catch {
-    // ignore
-  }
-
   return undefined;
 }
 
