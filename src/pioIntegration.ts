@@ -11,6 +11,7 @@ export interface PioEnvironment {
   elfPath: string;
   toolPath?: string;
   targetArch?: string;
+  romElfPath?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +286,73 @@ const CHIP_TARGET_MAP: Record<string, string> = {
 const RISCV_TARGETS = new Set(['esp32c2', 'esp32c3', 'esp32c5', 'esp32c6', 'esp32h2', 'esp32h4', 'esp32p4']);
 
 /**
+ * Get the raw chip name (e.g. "esp32c3") from a board.
+ * Used for ROM ELF lookup. Sorted by key length descending so
+ * "esp32s3" matches before "esp32".
+ */
+function getChipName(boardName: string | undefined, workspaceFolder?: string): string {
+  const sortedKeys = Object.keys(CHIP_TARGET_MAP).sort((a, b) => b.length - a.length);
+
+  if (boardName) {
+    const mcu = readBoardMcu(boardName, workspaceFolder);
+    if (mcu) {
+      const mcuNorm = mcu.toLowerCase().replace(/[-_]/g, '');
+      for (const key of sortedKeys) {
+        if (mcuNorm.includes(key)) {
+          return key;
+        }
+      }
+    }
+  }
+  return 'esp32';
+}
+
+/**
+ * Find ROM ELF file for a given chip from PlatformIO's tool-esp-rom-elfs package.
+ * Mirrors filter_exception_decoder.py's find_rom_elf() logic.
+ */
+function findRomElf(packagesDir: string, chipName: string): string | undefined {
+  const romElfsDir = path.join(packagesDir, 'tool-esp-rom-elfs');
+  if (!fs.existsSync(romElfsDir)) {
+    return undefined;
+  }
+
+  try {
+    const entries = fs.readdirSync(romElfsDir);
+    const patterns = [
+      new RegExp(`^${chipName}_rev\\d+_rom\\.elf$`),
+      new RegExp(`^${chipName}_rev\\d+\\.elf$`),
+      new RegExp(`^${chipName}.*_rom\\.elf$`),
+      new RegExp(`^${chipName}.*\\.elf$`),
+    ];
+
+    const matches: string[] = [];
+    for (const pattern of patterns) {
+      for (const entry of entries) {
+        if (pattern.test(entry) && !matches.includes(entry)) {
+          matches.push(entry);
+        }
+      }
+    }
+
+    if (matches.length === 0) {
+      return undefined;
+    }
+
+    // Sort by revision number (lowest first for max compatibility)
+    matches.sort((a, b) => {
+      const revA = a.match(/_rev(\d+)/);
+      const revB = b.match(/_rev(\d+)/);
+      return (revA ? parseInt(revA[1]) : 1e9) - (revB ? parseInt(revB[1]) : 1e9);
+    });
+
+    return path.join(romElfsDir, matches[0]);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Determine the chip name (trbr target arch) from a board name by reading its
  * board JSON from PlatformIO's boards directories.
  *
@@ -455,6 +523,13 @@ export async function findPioEnvironments(workspaceFolder: string): Promise<PioE
           env.toolPath = toolPath;
           env.targetArch = targetArch;
         }
+
+        // Find ROM ELF for the chip (like filter_exception_decoder.py)
+        const chipName = getChipName(board || envName, workspaceFolder);
+        const romElfPath = findRomElf(packagesDir, chipName);
+        if (romElfPath) {
+          env.romElfPath = romElfPath;
+        }
       }
 
       envs.push(env);
@@ -469,11 +544,12 @@ export async function findPioEnvironments(workspaceFolder: string): Promise<PioE
  */
 export async function selectElfFile(
   workspaceFolder: string | undefined
-): Promise<{ elfPath: string; toolPath?: string; targetArch?: string } | undefined> {
+): Promise<{ elfPath: string; toolPath?: string; targetArch?: string; romElfPath?: string } | undefined> {
   const items: (vscode.QuickPickItem & {
     elfPath?: string;
     toolPath?: string;
     targetArch?: string;
+    romElfPath?: string;
     action?: string;
   })[] = [];
 
@@ -490,6 +566,7 @@ export async function selectElfFile(
         elfPath: env.elfPath,
         toolPath: env.toolPath,
         targetArch: env.targetArch,
+        romElfPath: env.romElfPath,
       });
     }
   }
@@ -528,5 +605,6 @@ export async function selectElfFile(
     elfPath: (picked as any).elfPath,
     toolPath: (picked as any).toolPath,
     targetArch: (picked as any).targetArch,
+    romElfPath: (picked as any).romElfPath,
   };
 }

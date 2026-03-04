@@ -6,6 +6,7 @@ interface SessionConfig {
   elfPath?: string;
   toolPath?: string;
   targetArch?: string;
+  romElfPath?: string;
 }
 
 export class EspDecoderWebviewPanel {
@@ -147,7 +148,8 @@ export class EspDecoderWebviewPanel {
                 this.config.elfPath,
                 this.config.toolPath,
                 this.config.targetArch,
-                this.log
+                this.log,
+                this.config.romElfPath
               );
               event.decoded = decoded;
               this.postMessage({
@@ -326,7 +328,8 @@ export class EspDecoderWebviewPanel {
               this.config.elfPath,
               this.config.toolPath,
               this.config.targetArch,
-              this.log
+              this.log,
+              this.config.romElfPath
             );
             event.decoded = decoded;
             this.postMessage({
@@ -382,6 +385,7 @@ export class EspDecoderWebviewPanel {
       faultInfo: decoded.faultInfo,
       stacktrace: decoded.stacktrace,
       regs: decoded.regs,
+      regAnnotations: decoded.regAnnotations,
       allocInfo: decoded.allocInfo,
       rawOutput: decoded.rawOutput,
     };
@@ -757,6 +761,34 @@ export class EspDecoderWebviewPanel {
 
     .reg-value {
       color: var(--warning-fg);
+    }
+
+    /* Annotated registers (full-width layout) */
+    .registers-annotated {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+    }
+
+    .reg-entry-annotated {
+      display: flex;
+      gap: 8px;
+      padding: 1px 4px;
+      align-items: baseline;
+    }
+
+    .reg-entry-annotated .reg-name {
+      flex-shrink: 0;
+      min-width: 60px;
+    }
+
+    .reg-entry-annotated .reg-value {
+      flex-shrink: 0;
+    }
+
+    .reg-annotation {
+      color: var(--link-fg);
+      opacity: 0.85;
+      font-size: 11px;
     }
 
     /* Raw crash output */
@@ -1170,16 +1202,36 @@ export class EspDecoderWebviewPanel {
 
       // Registers
       if (decoded.regs && Object.keys(decoded.regs).length > 0) {
+        var hasAnnotations = decoded.regAnnotations && Object.keys(decoded.regAnnotations).length > 0;
         html += '<div class="crash-section">';
         html += '<div class="crash-section-title">Registers</div>';
-        html += '<div class="registers-grid">';
-        for (const [name, value] of Object.entries(decoded.regs)) {
-          html += '<div class="reg-entry">';
-          html += '<span class="reg-name">' + escapeHtml(name) + '</span>';
-          html += '<span class="reg-value">0x' + Number(value).toString(16).padStart(8, '0') + '</span>';
+
+        if (hasAnnotations) {
+          // Full-width layout with source annotations (like filter_exception_decoder.py)
+          html += '<div class="registers-annotated">';
+          for (const [name, value] of Object.entries(decoded.regs)) {
+            var annotation = decoded.regAnnotations ? decoded.regAnnotations[name] : null;
+            html += '<div class="reg-entry-annotated">';
+            html += '<span class="reg-name">' + escapeHtml(name) + '</span>';
+            html += '<span class="reg-value">0x' + Number(value).toString(16).padStart(8, '0') + '</span>';
+            if (annotation) {
+              html += '<span class="reg-annotation">' + escapeHtml(annotation) + '</span>';
+            }
+            html += '</div>';
+          }
+          html += '</div>';
+        } else {
+          // Compact grid when no annotations available
+          html += '<div class="registers-grid">';
+          for (const [name, value] of Object.entries(decoded.regs)) {
+            html += '<div class="reg-entry">';
+            html += '<span class="reg-name">' + escapeHtml(name) + '</span>';
+            html += '<span class="reg-value">0x' + Number(value).toString(16).padStart(8, '0') + '</span>';
+            html += '</div>';
+          }
           html += '</div>';
         }
-        html += '</div></div>';
+        html += '</div>';
       }
 
       // Show raw decoded output from trbr

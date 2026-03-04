@@ -47,6 +47,7 @@ export interface DecodedCrash {
   };
   stacktrace: StackFrame[];
   regs?: Record<string, number>;
+  regAnnotations?: Record<string, string>;
   allocInfo?: {
     allocAddr: string;
     allocSize: number;
@@ -145,7 +146,8 @@ export async function decodeCrash(
   elfPath: string,
   toolPath?: string,
   targetArch?: string,
-  log?: DecodeLogger
+  log?: DecodeLogger,
+  romElfPath?: string,
 ): Promise<DecodedCrash> {
   const abortController = new AbortController();
   const write = (msg: string) => {
@@ -224,7 +226,18 @@ export async function decodeCrash(
       /Stack memory:/i.test(crashEvent.rawText) &&
       toolPath
     ) {
-      await enhanceWithHeuristicStackFrames(decoded, crashEvent, elfPath, toolPath, log);
+      await enhanceWithHeuristicStackFrames(decoded, crashEvent, elfPath, toolPath, log, romElfPath);
+    }
+
+    // Resolve register addresses to source locations
+    // (like filter_exception_decoder.py's build_register_trace)
+    if (decoded.regs && toolPath) {
+      const addr2lineForRegs = deriveAddr2linePath(toolPath, log);
+      if (addr2lineForRegs) {
+        decoded.regAnnotations = await resolveRegisterAddresses(
+          decoded.regs, elfPath, addr2lineForRegs, log, romElfPath
+        );
+      }
     }
 
     return decoded;
@@ -484,6 +497,7 @@ async function resolveAddressesViaAddr2line(
   elfPath: string,
   addr2linePath: string,
   log?: DecodeLogger,
+  romElfPath?: string,
 ): Promise<StackFrame[]> {
   if (candidateAddrs.length === 0) { return []; }
 
@@ -573,6 +587,84 @@ async function resolveAddressesViaAddr2line(
       }
     }
 
+    // Try ROM ELF for addresses not resolved by firmware ELF
+    if (romElfPath) {
+      const resolvedAddrs = new Set(frames.map(f => f.address));
+      const unresolvedOrigAddrs = addrs.filter(a => !resolvedAddrs.has(a));
+      if (unresolvedOrigAddrs.length > 0) {
+        log?.appendLine(
+          `[ESP Decoder] Trying ROM ELF for ${unresolvedOrigAddrs.length} unresolved addresses`
+        );
+        const romLookupAddrs = unresolvedOrigAddrs.map(a => {
+          const val = parseInt(a, 16) - 1;
+          return `0x${(val >>> 0).toString(16).padStart(8, '0')}`;
+        });
+        try {
+          const { stdout: romStdout } = await execFileAsync(
+            addr2linePath, ['-fiaC', '-e', romElfPath, ...romLookupAddrs], { timeout: 15000 }
+          );
+          const romRawLines = romStdout.split('\n');
+          const romSections: string[][] = [];
+          let romCurrentBody: string[] = [];
+          for (const rawLine of romRawLines) {
+            const stripped = rawLine.trim();
+            if (!stripped) { continue; }
+            if (ADDR2LINE_HEADER_RE.test(stripped)) {
+              romSections.push(romCurrentBody);
+              romCurrentBody = [];
+            } else {
+              romCurrentBody.push(stripped);
+            }
+          }
+          romSections.push(romCurrentBody);
+          const romBodySections = romSections.slice(1);
+
+          for (let i = 0; i < unresolvedOrigAddrs.length && i < romBodySections.length; i++) {
+            const originalAddr = unresolvedOrigAddrs[i];
+            const body = romBodySections[i];
+            let j = 0;
+            let funcName: string | undefined;
+            let file: string | undefined;
+            let lineNum: string | undefined;
+
+            while (j + 1 < body.length) {
+              const func = body[j];
+              const loc = DISCRIMINATOR_RE.test(body[j + 1])
+                ? body[j + 1].replace(DISCRIMINATOR_RE, '')
+                : body[j + 1];
+              if (func === '??' && loc.startsWith('??:')) {
+                j += 2;
+                continue;
+              }
+              if (!funcName) {
+                funcName = func;
+                const colonIdx = loc.lastIndexOf(':');
+                if (colonIdx > 0) {
+                  file = loc.substring(0, colonIdx);
+                  const ln = loc.substring(colonIdx + 1);
+                  lineNum = ln && ln !== '0' && ln !== '?' ? ln : undefined;
+                }
+              }
+              j += 2;
+            }
+
+            if (funcName) {
+              frames.push({
+                address: originalAddr,
+                function: funcName,
+                file,
+                line: lineNum,
+              });
+            }
+          }
+        } catch (romErr) {
+          log?.appendLine(
+            `[ESP Decoder] ROM ELF addr2line failed: ${romErr instanceof Error ? romErr.message : String(romErr)}`
+          );
+        }
+      }
+    }
+
     return frames;
   } catch (err) {
     log?.appendLine(
@@ -655,6 +747,7 @@ async function enhanceWithHeuristicStackFrames(
   elfPath: string,
   toolPath: string,
   log?: DecodeLogger,
+  romElfPath?: string,
 ): Promise<void> {
   const write = (msg: string) => log?.appendLine(msg);
 
@@ -681,7 +774,7 @@ async function enhanceWithHeuristicStackFrames(
 
   if (addr2linePath) {
     write?.(`[ESP Decoder] Using addr2line for heuristic resolution: ${addr2linePath}`);
-    heuristicFrames = await resolveAddressesViaAddr2line(newAddrs, elfPath, addr2linePath, log);
+    heuristicFrames = await resolveAddressesViaAddr2line(newAddrs, elfPath, addr2linePath, log, romElfPath);
   } else {
     write?.('[ESP Decoder] addr2line not found — falling back to GDB batch mode');
     heuristicFrames = await resolveAddressesViaGdb(newAddrs, elfPath, toolPath, log);
@@ -699,6 +792,209 @@ async function enhanceWithHeuristicStackFrames(
   } else {
     write?.('[ESP Decoder] Heuristic: no candidate addresses resolved to known functions');
   }
+}
+
+/**
+ * Registers that should not be resolved to code addresses.
+ * These are data pointers, exception-related values, or status registers.
+ */
+const NON_CODE_REGISTERS = new Set([
+  'EXCVADDR', 'MTVAL', 'MSTATUS', 'MHARTID',
+  'PS', 'SAR', 'LBEG', 'LEND', 'LCOUNT',
+  'EXCCAUSE', 'MCAUSE',
+  'SP', 'GP', 'TP', 'X0',
+]);
+
+/**
+ * RISC-V exception cause descriptions (same as filter_exception_decoder.py).
+ */
+const RISCV_EXCEPTIONS: Record<number, string> = {
+  0x0: 'Instruction address misaligned',
+  0x1: 'Instruction access fault',
+  0x2: 'Illegal instruction',
+  0x3: 'Breakpoint',
+  0x4: 'Load address misaligned',
+  0x5: 'Load access fault',
+  0x6: 'Store/AMO address misaligned',
+  0x7: 'Store/AMO access fault',
+  0x8: 'Environment call from U-mode',
+  0x9: 'Environment call from S-mode',
+  0xb: 'Environment call from M-mode',
+  0xc: 'Instruction page fault',
+  0xd: 'Load page fault',
+  0xf: 'Store/AMO page fault',
+};
+
+/**
+ * Xtensa exception cause descriptions.
+ */
+const XTENSA_EXCEPTIONS: (string | null)[] = [
+  'IllegalInstruction',         // 0
+  'Syscall',                    // 1
+  'InstructionFetchError',      // 2
+  'LoadStoreError',             // 3
+  'Level1Interrupt',            // 4
+  'Alloca',                     // 5
+  'IntegerDivideByZero',        // 6
+  null,                         // 7 reserved
+  'Privileged',                 // 8
+  'LoadStoreAlignment',         // 9
+  null, null,                   // 10-11 reserved
+  'InstrPIFDataError',          // 12
+  'LoadStorePIFDataError',      // 13
+  'InstrPIFAddrError',          // 14
+  'LoadStorePIFAddrError',      // 15
+  'InstTLBMiss',                // 16
+  'InstTLBMultiHit',            // 17
+  'InstFetchPrivilege',         // 18
+  null,                         // 19 reserved
+  'InstFetchProhibited',        // 20
+  null, null, null,             // 21-23 reserved
+  'LoadStoreTLBMiss',           // 24
+  'LoadStoreTLBMultiHit',       // 25
+  'LoadStorePrivilege',         // 26
+  null,                         // 27 reserved
+  'LoadProhibited',             // 28
+  'StoreProhibited',            // 29
+];
+
+/**
+ * Resolve register addresses to source locations using addr2line.
+ * Annotates code-address registers with function/file:line info,
+ * similar to filter_exception_decoder.py's build_register_trace().
+ * Also adds MCAUSE/EXCCAUSE exception descriptions.
+ */
+async function resolveRegisterAddresses(
+  regs: Record<string, number>,
+  elfPath: string,
+  addr2linePath: string,
+  log?: DecodeLogger,
+  romElfPath?: string,
+): Promise<Record<string, string>> {
+  const annotations: Record<string, string> = {};
+
+  // Handle MCAUSE / EXCCAUSE with exception descriptions
+  for (const [name, value] of Object.entries(regs)) {
+    const upperName = name.toUpperCase();
+    if (upperName === 'MCAUSE') {
+      if (value & 0x80000000) {
+        const cause = value & 0x7FFFFFFF;
+        annotations[name] = `Interrupt (cause ${cause})`;
+      } else {
+        const desc = RISCV_EXCEPTIONS[value];
+        if (desc) {
+          annotations[name] = desc;
+        }
+      }
+    } else if (upperName === 'EXCCAUSE') {
+      if (value >= 0 && value < XTENSA_EXCEPTIONS.length) {
+        const desc = XTENSA_EXCEPTIONS[value];
+        if (desc) {
+          annotations[name] = desc;
+        }
+      }
+    }
+  }
+
+  // Collect code-address registers for batch resolution
+  const candidates: { reg: string; lookupAddr: string }[] = [];
+  for (const [name, value] of Object.entries(regs)) {
+    const upperName = name.toUpperCase();
+    if (NON_CODE_REGISTERS.has(upperName)) { continue; }
+    // Code space check (0x40000000–0x4FFFFFFF)
+    if (value >= 0x40000000 && value < 0x50000000) {
+      // RA is a return address — decrement by 1 for call-site resolution
+      const isRetAddr = upperName === 'RA';
+      const lookupVal = isRetAddr ? value - 1 : value;
+      candidates.push({
+        reg: name,
+        lookupAddr: `0x${(lookupVal >>> 0).toString(16).padStart(8, '0')}`,
+      });
+    }
+  }
+
+  if (candidates.length === 0) { return annotations; }
+
+  const lookupAddrs = candidates.map(c => c.lookupAddr);
+
+  // Resolve against firmware ELF, then ROM ELF for unresolved
+  const elfPaths = [elfPath];
+  if (romElfPath) { elfPaths.push(romElfPath); }
+
+  const resolvedMap = new Map<string, string>(); // lookupAddr → annotation
+
+  for (const elf of elfPaths) {
+    const unresolvedAddrs = lookupAddrs.filter(a => !resolvedMap.has(a));
+    if (unresolvedAddrs.length === 0) { break; }
+
+    const args = ['-fiaC', '-e', elf, ...unresolvedAddrs];
+    try {
+      const { stdout } = await execFileAsync(addr2linePath, args, { timeout: 15000 });
+      const rawLines = stdout.split('\n');
+      const sections: string[][] = [];
+      let currentBody: string[] = [];
+
+      for (const rawLine of rawLines) {
+        const stripped = rawLine.trim();
+        if (!stripped) { continue; }
+        if (ADDR2LINE_HEADER_RE.test(stripped)) {
+          sections.push(currentBody);
+          currentBody = [];
+        } else {
+          currentBody.push(stripped);
+        }
+      }
+      sections.push(currentBody);
+      const bodySections = sections.slice(1);
+
+      for (let i = 0; i < unresolvedAddrs.length && i < bodySections.length; i++) {
+        const addr = unresolvedAddrs[i];
+        if (resolvedMap.has(addr)) { continue; }
+
+        const body = bodySections[i];
+        const parts: string[] = [];
+        let j = 0;
+        while (j + 1 < body.length) {
+          const func = body[j];
+          const loc = DISCRIMINATOR_RE.test(body[j + 1])
+            ? body[j + 1].replace(DISCRIMINATOR_RE, '')
+            : body[j + 1];
+          if (func === '??' && loc.startsWith('??:')) {
+            j += 2;
+            continue;
+          }
+          parts.push(`${func} at ${loc}`);
+          j += 2;
+        }
+
+        if (parts.length > 0) {
+          let annotation = parts[0];
+          for (let k = 1; k < parts.length; k++) {
+            annotation += '\n     (inlined by) ' + parts[k];
+          }
+          resolvedMap.set(addr, annotation);
+        }
+      }
+    } catch (err) {
+      log?.appendLine(
+        `[ESP Decoder] Register addr2line failed for ${elf}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  // Map back from lookup addresses to register names
+  for (const candidate of candidates) {
+    const annotation = resolvedMap.get(candidate.lookupAddr);
+    if (annotation) {
+      annotations[candidate.reg] = annotation;
+    }
+  }
+
+  log?.appendLine(
+    `[ESP Decoder] Register annotations: ${Object.keys(annotations).length} of ${Object.keys(regs).length} registers resolved`
+  );
+
+  return annotations;
 }
 
 /**

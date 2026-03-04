@@ -12,6 +12,7 @@ let sessionConfig: {
   elfPath?: string;
   toolPath?: string;
   targetArch?: string;
+  romElfPath?: string;
 } = {};
 
 export function activate(context: vscode.ExtensionContext) {
@@ -136,6 +137,7 @@ export function activate(context: vscode.ExtensionContext) {
           elfPath: result.elfPath,
           toolPath: result.toolPath || sessionConfig.toolPath,
           targetArch: result.targetArch || sessionConfig.targetArch,
+          romElfPath: result.romElfPath || sessionConfig.romElfPath,
         };
 
         if (currentPanel) {
@@ -223,6 +225,7 @@ async function tryAutoDetectElf(): Promise<void> {
         elfPath: envs[0].elfPath,
         toolPath: envs[0].toolPath,
         targetArch: envs[0].targetArch,
+        romElfPath: envs[0].romElfPath,
       };
     } else if (envs.length > 1) {
       // Multiple envs, pick the newest one
@@ -243,6 +246,7 @@ async function tryAutoDetectElf(): Promise<void> {
         elfPath: newest.elfPath,
         toolPath: newest.toolPath,
         targetArch: newest.targetArch,
+        romElfPath: newest.romElfPath,
       };
     }
   } catch {
