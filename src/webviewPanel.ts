@@ -148,6 +148,13 @@ export class EspDecoderWebviewPanel {
                 this.config.targetArch
               );
               event.decoded = decoded;
+              
+              // Send decoded output to serial monitor
+              this.postMessage({
+                type: 'serialData',
+                data: '\n\n========== DECODED CRASH ==========\n' + decoded.rawOutput + '\n===================================\n\n'
+              });
+              
               this.postMessage({
                 type: 'crashDecoded',
                 eventId: event.id,
