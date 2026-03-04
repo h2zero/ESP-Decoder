@@ -359,22 +359,8 @@ function findRomElf(packagesDir: string, chipName: string): string | undefined {
  * Longest chip keys are compared first so that "esp32s3" is not confused with "esp32".
  */
 function getChipTarget(boardName: string | undefined, workspaceFolder?: string): string {
-  const sortedKeys = Object.keys(CHIP_TARGET_MAP).sort((a, b) => b.length - a.length);
-
-  // Try reading MCU from board JSON
-  if (boardName) {
-    const mcu = readBoardMcu(boardName, workspaceFolder);
-    if (mcu) {
-      const mcuNorm = mcu.toLowerCase().replace(/[-_]/g, '');
-      for (const key of sortedKeys) {
-        if (mcuNorm.includes(key)) {
-          return CHIP_TARGET_MAP[key];
-        }
-      }
-    }
-  }
-
-  return 'xtensa';
+  const chipName = getChipName(boardName, workspaceFolder);
+  return CHIP_TARGET_MAP[chipName] ?? 'xtensa';
 }
 
 function getPioCoreDir(): string | undefined {
