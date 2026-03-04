@@ -1,0 +1,69 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" fill="#E7352C" opacity="0.95"/>
+  
+  <!-- Microcontroller chip body -->
+  <rect x="38" y="38" width="52" height="52" rx="4" fill="#2C2C2C" stroke="#FFFFFF" stroke-width="2"/>
+  
+  <!-- Chip pins - left side -->
+  <rect x="28" y="42" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="28" y="50" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="28" y="58" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="28" y="66" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="28" y="74" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="28" y="82" width="10" height="3" fill="#CCCCCC"/>
+  
+  <!-- Chip pins - right side -->
+  <rect x="90" y="42" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="90" y="50" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="90" y="58" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="90" y="66" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="90" y="74" width="10" height="3" fill="#CCCCCC"/>
+  <rect x="90" y="82" width="10" height="3" fill="#CCCCCC"/>
+  
+  <!-- Chip pins - top side -->
+  <rect x="42" y="28" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="50" y="28" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="58" y="28" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="66" y="28" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="74" y="28" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="82" y="28" width="3" height="10" fill="#CCCCCC"/>
+  
+  <!-- Chip pins - bottom side -->
+  <rect x="42" y="90" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="50" y="90" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="58" y="90" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="66" y="90" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="74" y="90" width="3" height="10" fill="#CCCCCC"/>
+  <rect x="82" y="90" width="3" height="10" fill="#CCCCCC"/>
+  
+  <!-- ESP letters as paths -->
+  <g fill="#FFFFFF">
+    <!-- E -->
+    <rect x="48" y="52" width="8" height="2"/>
+    <rect x="48" y="52" width="2" height="12"/>
+    <rect x="48" y="57" width="7" height="2"/>
+    <rect x="48" y="62" width="8" height="2"/>
+    
+    <!-- S -->
+    <rect x="58" y="52" width="7" height="2"/>
+    <rect x="58" y="52" width="2" height="5"/>
+    <rect x="58" y="57" width="7" height="2"/>
+    <rect x="63" y="59" width="2" height="3"/>
+    <rect x="58" y="62" width="7" height="2"/>
+    
+    <!-- P -->
+    <rect x="67" y="52" width="2" height="12"/>
+    <rect x="67" y="52" width="7" height="2"/>
+    <rect x="72" y="54" width="2" height="3"/>
+    <rect x="67" y="57" width="7" height="2"/>
+  </g>
+  
+  <!-- Espressif E logo -->
+  <path d="M 48 78 L 58 78 L 58 80 L 50 80 L 50 82 L 57 82 L 57 84 L 50 84 L 50 86 L 58 86 L 58 88 L 48 88 Z" fill="#FFFFFF"/>
+  
+  <!-- Debug symbol (magnifying glass) -->
+  <circle cx="78" cy="82" r="5" fill="none" stroke="#FFFFFF" stroke-width="1.5"/>
+  <line x1="82" y1="86" x2="85" y2="89" stroke="#FFFFFF" stroke-width="1.5" stroke-linecap="round"/>
+  <circle cx="78" cy="82" r="2" fill="#E7352C"/>
+</svg>

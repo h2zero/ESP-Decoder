@@ -1,22 +1,22 @@
-# ESP Decoder — VS Code Extension
+# ESP Crash Decoder — VS Code Extension
 
-Decode ESP32/ESP8266 crash dumps directly from the serial port in VS Code.  
-Powered by [TraceBreaker (trbr)](https://github.com/dankeboy36/trbr) as a library dependency.  
+Decode ESP32 crash dumps directly from the serial port in VS Code.  
+Powered by [TraceBreaker (trbr)](https://github.com/dankeboy36/trbr).  
 Designed to work with **pioarduino**.
 
 ## Features
 
 - **Serial Monitor** — Connect to any serial port, view output in real-time
 - **Automatic Crash Detection** — Detects Guru Meditation Errors, backtraces, panics, asserts
-- **Crash Decoding** — Decodes stack traces using `addr2line`/GDB from PlatformIO toolchains
+- **Crash Decoding** — Decodes stack traces using `addr2line`/GDB from espressif toolchains
 - **PlatformIO Integration** — Auto-detects `firmware.elf` and toolchain from `.pio/build/`
 - **Click-to-Navigate** — Click on decoded file:line references to open source files
 - **Register Display** — Shows CPU register values at the time of crash
-- **Multi-Arch Support** — Xtensa (ESP32, ESP8266) and RISC-V (ESP32-C3/C6/H2)
+- **Multi-Arch Support** — Xtensa (ESP32/S2/S3) and RISC-V (ESP32-C3/C6/H2)
 
 ## Quick Start
 
-1. Open a PlatformIO project in VS Code
+1. Open a pioarduino project in VS Code
 2. Build your firmware (`pio run`)
 3. Run command: **ESP Decoder: Open Serial Monitor & Crash Decoder**
 4. Select serial port and connect
@@ -54,16 +54,17 @@ Designed to work with **pioarduino**.
 3. When a crash block is detected, it appears in the **Crash Events** tab
 4. If an ELF file is configured, the crash is automatically decoded:
    - Backtrace addresses are resolved to function names and source locations
+   - Stack memory is resolved to function names and source locations
    - Register values are extracted and displayed
    - Fault information (cause, core, address) is shown
 5. Clicking on source file references opens the file at the correct line
 
-## pioarduino / PlatformIO Setup
+## pioarduino Setup
 
 The extension auto-detects:
 
 - **ELF file**: `<workspace>/.pio/build/<env>/firmware.elf`
-- **Toolchain**: From PlatformIO packages (`~/.platformio/packages/`)
+- **Toolchain**: From packages (`~/.platformio/packages/`)
 - **Architecture**: From board configuration in `platformio.ini`
 
 Make sure you have built your project at least once before connecting the monitor.
@@ -89,9 +90,13 @@ Or install from the Extensions sidebar: "Install from VSIX..."
 
 - VS Code 1.85+
 - Node.js 18+ (for the `serialport` native module)
-- PlatformIO or pioarduino installed in the workspace
+- pioarduino installed in the workspace
 - A built firmware (`.elf` file)
 
 ## License
 
 GPL-3.0 — same as trbr
+
+## Copyright
+
+Jason2866
