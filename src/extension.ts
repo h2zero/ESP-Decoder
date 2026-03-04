@@ -30,36 +30,23 @@ export function activate(context: vscode.ExtensionContext) {
   }
   context.subscriptions.push(serialManager);
 
-  // Status bar items
-  const statusBarPort = vscode.window.createStatusBarItem(
+  // Status bar item - opens ESP Connect window
+  const statusBarConnection = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
     100
   );
-  statusBarPort.command = 'esp-decoder.selectPort';
-  statusBarPort.text = '$(plug) ESP: No Port';
-  statusBarPort.tooltip = 'Select serial port for ESP Decoder';
-  statusBarPort.show();
-  context.subscriptions.push(statusBarPort);
-
-  const statusBarConnection = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Left,
-    99
-  );
-  statusBarConnection.command = 'esp-decoder.connect';
-  statusBarConnection.text = '$(circle-slash) Disconnected';
-  statusBarConnection.tooltip = 'Connect/Disconnect serial port';
+  statusBarConnection.command = 'esp-decoder.openMonitor';
+  statusBarConnection.text = '$(circle-slash) ESP Disconnected';
+  statusBarConnection.tooltip = 'Open ESP Decoder Monitor';
   statusBarConnection.show();
   context.subscriptions.push(statusBarConnection);
 
   // Update status bar on connection changes
   serialManager.onConnectionChange((connected) => {
     if (connected) {
-      statusBarConnection.text = '$(check) Connected';
-      statusBarConnection.command = 'esp-decoder.disconnect';
-      statusBarPort.text = `$(plug) ${serialManager.selectedPath || 'ESP'}`;
+      statusBarConnection.text = `$(check) ESP Connected: ${serialManager.selectedPath || '?'}`;
     } else {
-      statusBarConnection.text = '$(circle-slash) Disconnected';
-      statusBarConnection.command = 'esp-decoder.connect';
+      statusBarConnection.text = '$(circle-slash) ESP Disconnected';
     }
   });
 
@@ -73,15 +60,6 @@ export function activate(context: vscode.ExtensionContext) {
         sessionConfig,
         outputChannel
       );
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('esp-decoder.selectPort', async () => {
-      const port = await serialManager.selectPort();
-      if (port) {
-        statusBarPort.text = `$(plug) ${port}`;
-      }
     })
   );
 

@@ -2,7 +2,7 @@
 
 Decode ESP32 crash dumps directly from the serial port in VS Code.  
 Powered by [TraceBreaker (trbr)](https://github.com/dankeboy36/trbr).  
-Designed to work with **pioarduino**.
+Designed to work with [**pioarduino**](https://marketplace.visualstudio.com/items?itemName=pioarduino.pioarduino-ide).
 
 ## Features
 
