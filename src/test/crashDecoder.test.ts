@@ -177,6 +177,27 @@ describe('decodeCrash – ESP32-C6 with real ELF', () => {
   );
 
   it.skipIf(!fs.existsSync(ELF_PATH) || !fs.existsSync(GDB_PATH))(
+    'heuristic resolves stack memory addresses (ble_hs, vPortTaskWrapper)',
+    async () => {
+      const event = makeCrashEvent();
+      const decoded = await decodeCrash(event, ELF_PATH, GDB_PATH, 'esp32c6');
+
+      // These addresses are in the stack memory dump and should be resolved
+      // by the heuristic stack analysis:
+      //   0x4200cf9e → ble_hs_event_rx_hci_ev
+      //   0x4200d57e → ble_hs_enqueue_hci_event
+      //   0x4200e2fa → ble_hs_hci_rx_evt
+      //   0x4080d2da → vPortTaskWrapper
+      const resolvedFuncs = decoded.stacktrace
+        .map((f) => f.function ?? '')
+        .join(' ');
+
+      expect(resolvedFuncs).toMatch(/ble_hs/i);
+      expect(resolvedFuncs).toMatch(/vPortTaskWrapper/i);
+    }
+  );
+
+  it.skipIf(!fs.existsSync(ELF_PATH) || !fs.existsSync(GDB_PATH))(
     'raw decode fallback extracts MEPC register',
     async () => {
       const event = makeCrashEvent();

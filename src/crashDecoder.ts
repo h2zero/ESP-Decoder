@@ -374,7 +374,6 @@ export async function decodeCrash(
     // from the Stack memory dump and resolve them via GDB batch mode.
     if (
       crashEvent.kind === 'riscv' &&
-      decoded.stacktrace.length <= 3 &&
       /Stack memory:/i.test(crashEvent.rawText) &&
       toolPath
     ) {
@@ -600,10 +599,9 @@ function stringifyAddrLocation(location: any): string {
 
 /**
  * Extract candidate return addresses from a RISC-V Stack memory hex dump.
- * Returns deduplicated addresses that fall within ESP code space (0x40000000–0x4FFFFFFF).
+ * Returns addresses (preserving duplicates) that fall within ESP code space (0x40000000–0x4FFFFFFF).
  */
 function extractStackCandidateAddresses(crashText: string): string[] {
-  const seen = new Set<number>();
   const addresses: string[] = [];
   const lines = crashText.split('\n');
   let inStackMemory = false;
@@ -622,8 +620,7 @@ function extractStackCandidateAddresses(crashText: string): string[] {
         for (const word of words) {
           const val = parseInt(word, 16);
           // Code space: 0x40000000–0x4FFFFFFF (covers flash-mapped code on all ESP chips)
-          if (val >= 0x40000000 && val < 0x50000000 && !seen.has(val)) {
-            seen.add(val);
+          if (val >= 0x40000000 && val < 0x50000000) {
             addresses.push(`0x${val.toString(16).padStart(8, '0')}`);
           }
         }
@@ -956,6 +953,41 @@ async function resolveAddressesViaGdb(
  * trbr's GDB-server-based unwinding yields few frames.
  * Mutates the decoded object by appending heuristic frames to its stacktrace.
  */
+/**
+ * Extract code-space register addresses from a RISC-V register dump.
+ * Returns addresses in register-importance order (MEPC, RA, then others).
+ */
+function extractRegisterCodeAddresses(crashText: string): string[] {
+  const addresses: string[] = [];
+  const regPattern =
+    /\b(MEPC|RA|MTVEC|S\d+(?:\/FP)?|T\d+|A\d+)\s*[:=]\s*(0x[0-9a-fA-F]+)/gi;
+  // Priority registers first
+  const priorityOrder = ['MEPC', 'RA', 'MTVEC'];
+  const found = new Map<string, number>();
+
+  let match;
+  while ((match = regPattern.exec(crashText)) !== null) {
+    const name = match[1].toUpperCase().replace(/\/FP$/, '');
+    const val = parseInt(match[2], 16);
+    if (val >= 0x40000000 && val < 0x50000000) {
+      found.set(name, val);
+    }
+  }
+
+  // Emit priority registers first, then the rest
+  for (const prio of priorityOrder) {
+    const val = found.get(prio);
+    if (val !== undefined) {
+      addresses.push(`0x${val.toString(16).padStart(8, '0')}`);
+      found.delete(prio);
+    }
+  }
+  for (const [, val] of found) {
+    addresses.push(`0x${val.toString(16).padStart(8, '0')}`);
+  }
+  return addresses;
+}
+
 async function enhanceWithHeuristicStackFrames(
   decoded: DecodedCrash,
   crashEvent: CrashEvent,
@@ -966,7 +998,10 @@ async function enhanceWithHeuristicStackFrames(
 ): Promise<void> {
   const write = (msg: string) => log?.appendLine(msg);
 
-  const candidateAddrs = extractStackCandidateAddresses(crashEvent.rawText);
+  // Combine register code addresses (MEPC, RA, MTVEC, …) with stack memory addresses
+  const registerAddrs = extractRegisterCodeAddresses(crashEvent.rawText);
+  const stackAddrs = extractStackCandidateAddresses(crashEvent.rawText);
+  const candidateAddrs = [...registerAddrs, ...stackAddrs];
 
   // Remove addresses already in the resolved stacktrace
   const existingAddrs = new Set(
