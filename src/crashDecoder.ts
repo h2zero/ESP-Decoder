@@ -21,6 +21,10 @@ import type {
   DecodeOptions,
 } from 'trbr';
 import { getPioPackagesDir } from './pioIntegration';
+import { Addr2linePool } from './addr2lineResolver';
+
+// Re-export for consumers
+export { Addr2linePool } from './addr2lineResolver';
 
 /**
  * Represents a captured crash event from serial data.
@@ -294,6 +298,7 @@ export async function decodeCrash(
   targetArch?: string,
   log?: DecodeLogger,
   romElfPath?: string,
+  addr2linePool?: Addr2linePool,
 ): Promise<DecodedCrash> {
   const abortController = new AbortController();
   const write = (msg: string) => {
@@ -301,11 +306,8 @@ export async function decodeCrash(
   };
 
   if (!toolPath) {
-    write('[ESP Decoder] No toolPath configured — trying PlatformIO auto-detection');
     toolPath = autoDetectPioToolPath(crashEvent.kind, log);
-    if (toolPath) {
-      write(`[ESP Decoder] Auto-detected toolPath: ${toolPath}`);
-    } else {
+    if (!toolPath) {
       write('[ESP Decoder] No toolPath (GDB/addr2line) found — returning raw decode');
       return createRawDecode(crashEvent.rawText);
     }
@@ -314,7 +316,37 @@ export async function decodeCrash(
   try {
     // Resolve target architecture to a value trbr understands
     const resolvedArch = resolveTargetArch(targetArch, crashEvent.kind);
-    write(`[ESP Decoder] Resolved target arch: ${resolvedArch} (config=${targetArch ?? 'auto'}, crashKind=${crashEvent.kind})`);
+
+    // === Xtensa fast-path: resolve backtrace addresses directly via addr2line ===
+    if (crashEvent.kind === 'xtensa' && /Backtrace:/i.test(crashEvent.rawText)) {
+      const addr2linePath = deriveAddr2linePath(toolPath!, log);
+      if (addr2linePath) {
+        const btAddrs = extractXtensaBacktraceAddresses(crashEvent.rawText);
+        if (btAddrs.length > 0) {
+          const faultInfo = parseXtensaFaultInfo(crashEvent.rawText);
+          const regs = parseRegisters(crashEvent.rawText);
+          const hasRegs = Object.keys(regs).length > 0;
+
+          // Resolve backtrace frames and register annotations in parallel
+          const [frames, regAnnotations] = await Promise.all([
+            resolveAddressesViaAddr2line(btAddrs, elfPath, addr2linePath, log, romElfPath, addr2linePool),
+            hasRegs
+              ? resolveRegisterAddresses(regs, elfPath, addr2linePath, log, romElfPath)
+              : Promise.resolve(undefined),
+          ]);
+
+          if (frames.length > 0) {
+            return {
+              faultInfo,
+              stacktrace: frames,
+              regs: hasRegs ? regs : undefined,
+              regAnnotations,
+              rawOutput: '',
+            };
+          }
+        }
+      }
+    }
 
     // Build DecodeParams via trbr's createDecodeParams
     let params: any;
@@ -324,78 +356,62 @@ export async function decodeCrash(
         toolPath,
         targetArch: resolvedArch as any,
       });
-      write(`[ESP Decoder] createDecodeParams OK`);
     } catch (e) {
       write(`[ESP Decoder] createDecodeParams failed, using raw params: ${e instanceof Error ? e.message : String(e)}`);
       params = { elfPath, toolPath, targetArch: resolvedArch };
     }
 
-    write(`[ESP Decoder] Calling trbr decode — elfPath=${params.elfPath}, toolPath=${params.toolPath}, targetArch=${params.targetArch}`);
-    write(`[ESP Decoder] Crash input (${crashEvent.rawText.length} chars, ${crashEvent.lines.length} lines, kind=${crashEvent.kind})`);
-
-    // Build decode options with trbr debug callback routed to the output channel
+    // Build decode options
     const decodeOptions: DecodeOptions = {
       signal: abortController.signal,
-      debug: (formatter: any, ...args: any[]) => {
-        // Format debug output: trbr passes a prefix string + args
-        const parts = [String(formatter), ...args.map((a: any) => {
-          if (typeof a === 'string') { return a; }
-          try { return JSON.stringify(a); } catch { return String(a); }
-        })];
-        write(`[trbr] ${parts.join(' ')}`);
-      },
     };
 
     const result = await decode(params, crashEvent.rawText, decodeOptions);
 
     const decRes = Array.isArray(result) ? result[0]?.result ?? result[0] : result;
-    const summary = {
-      stacktraceLinesCount: decRes?.stacktraceLines?.length ?? 0,
-      hasFaultInfo: !!decRes?.faultInfo,
-      faultMessage: decRes?.faultInfo?.faultMessage,
-      hasRegs: !!decRes?.regs,
-      regCount: decRes?.regs ? Object.keys(decRes.regs).length : 0,
-      isCoredumpResult: Array.isArray(result),
-    };
-    write(`[ESP Decoder] trbr decode result: ${JSON.stringify(summary)}`);
 
-    if (summary.stacktraceLinesCount === 0) {
-      write('[ESP Decoder] WARNING: trbr returned 0 stacktrace lines — the GDB server/client may have failed to unwind the stack. Check that toolPath points to a working GDB and the ELF matches the firmware.');
+    if ((decRes?.stacktraceLines?.length ?? 0) === 0) {
+      write('[ESP Decoder] WARNING: trbr returned 0 stacktrace lines — check that toolPath points to a working GDB and the ELF matches the firmware.');
     }
 
     // Convert trbr's DecodeResult to our DecodedCrash format
     const decoded = convertDecodeResult(result, crashEvent.rawText);
 
+    // Post-processing: heuristic stack enhancement (RISC-V) + register annotations.
+    // These use independent addr2line invocations, so run them in parallel.
+    const postProcessTasks: Promise<void>[] = [];
+
     // For RISC-V crashes: enhance with heuristic stack analysis when
     // trbr's GDB-server-based unwinding yields few frames.
-    // The panic GDB server only serves stack RAM data — code/flash reads
-    // return 0x00, preventing GDB from analyzing function prologues to
-    // unwind the full call chain.  We extract candidate return addresses
-    // from the Stack memory dump and resolve them via GDB batch mode.
     if (
       crashEvent.kind === 'riscv' &&
       /Stack memory:/i.test(crashEvent.rawText) &&
       toolPath
     ) {
-      await enhanceWithHeuristicStackFrames(decoded, crashEvent, elfPath, toolPath, log, romElfPath);
+      postProcessTasks.push(
+        enhanceWithHeuristicStackFrames(decoded, crashEvent, elfPath, toolPath, log, romElfPath, addr2linePool)
+      );
     }
 
     // Resolve register addresses to source locations
-    // (like filter_exception_decoder.py's build_register_trace)
     if (decoded.regs && toolPath) {
       const addr2lineForRegs = deriveAddr2linePath(toolPath, log);
       if (addr2lineForRegs) {
-        decoded.regAnnotations = await resolveRegisterAddresses(
-          decoded.regs, elfPath, addr2lineForRegs, log, romElfPath
+        postProcessTasks.push(
+          resolveRegisterAddresses(decoded.regs, elfPath, addr2lineForRegs, log, romElfPath)
+            .then(annotations => { decoded.regAnnotations = annotations; })
         );
       }
+    }
+
+    if (postProcessTasks.length > 0) {
+      await Promise.all(postProcessTasks);
     }
 
     return decoded;
   } catch (err) {
     const errMsg = err instanceof Error ? err.stack || err.message : String(err);
-    write(`[ESP Decoder] trbr decode FAILED: ${errMsg}`);
-    write('[ESP Decoder] Falling back to raw crash text parsing');
+    write(`[ESP Decoder] decode failed: ${errMsg}`);
     return createRawDecode(crashEvent.rawText);
   }
 }
@@ -674,7 +690,6 @@ function deriveAddr2linePath(gdbPath: string, log?: DecodeLogger): string | unde
   // 1. Same directory as GDB binary
   const sameDir = path.join(path.dirname(gdbPath), addr2lineName);
   if (fs.existsSync(sameDir)) {
-    log?.appendLine(`[ESP Decoder] addr2line found next to GDB: ${sameDir}`);
     return sameDir;
   }
 
@@ -687,7 +702,6 @@ function deriveAddr2linePath(gdbPath: string, log?: DecodeLogger): string | unde
       if (entry.startsWith('toolchain-')) {
         const candidate = path.join(packagesDir, entry, 'bin', addr2lineName);
         if (fs.existsSync(candidate)) {
-          log?.appendLine(`[ESP Decoder] addr2line found in toolchain: ${candidate}`);
           return candidate;
         }
       }
@@ -725,11 +739,43 @@ async function resolveAddressesViaAddr2line(
   addr2linePath: string,
   log?: DecodeLogger,
   romElfPath?: string,
+  pool?: Addr2linePool,
 ): Promise<StackFrame[]> {
   if (candidateAddrs.length === 0) { return []; }
 
   // Limit to 200 addresses to keep command-line length reasonable
   const addrs = candidateAddrs.slice(0, 200);
+
+  // Use persistent addr2line process if pool is available
+  if (pool) {
+    try {
+      const resolver = pool.get(addr2linePath, elfPath);
+      const results = await resolver.resolveBatch(addrs);
+      const frames: StackFrame[] = results
+        .filter(r => r.function)
+        .map(r => ({ address: r.address, function: r.function, file: r.file, line: r.line }));
+
+      // Try ROM ELF for unresolved addresses
+      if (romElfPath) {
+        const resolvedAddrs = new Set(frames.map(f => f.address));
+        const unresolvedAddrs = addrs.filter(a => !resolvedAddrs.has(a));
+        if (unresolvedAddrs.length > 0) {
+          const romResolver = pool.get(addr2linePath, romElfPath);
+          const romResults = await romResolver.resolveBatch(unresolvedAddrs);
+          for (const r of romResults) {
+            if (r.function) {
+              frames.push({ address: r.address, function: r.function, file: r.file, line: r.line });
+            }
+          }
+        }
+      }
+
+      return frames;
+    } catch (err) {
+      log?.appendLine(`[ESP Decoder] Pool addr2line failed, falling back to one-shot: ${err instanceof Error ? err.message : String(err)}`);
+      // Fall through to one-shot approach
+    }
+  }
 
   // Build args: addr2line -fiaC -e <elf> <addr1> <addr2> ...
   // Addresses are passed as-is (no decrement).
@@ -737,9 +783,6 @@ async function resolveAddressesViaAddr2line(
 
   try {
     const { stdout } = await execFileAsync(addr2linePath, args, { timeout: 15000 });
-    log?.appendLine(
-      `[ESP Decoder] addr2line batch: ${stdout.length} chars output for ${addrs.length} addresses`
-    );
 
     // Parse output using pioarduino/filter_exception_decoder.py's state-machine approach:
     //   Split into sections by address header lines (0x...),
@@ -814,9 +857,6 @@ async function resolveAddressesViaAddr2line(
       const resolvedAddrs = new Set(frames.map(f => f.address));
       const unresolvedOrigAddrs = addrs.filter(a => !resolvedAddrs.has(a));
       if (unresolvedOrigAddrs.length > 0) {
-        log?.appendLine(
-          `[ESP Decoder] Trying ROM ELF for ${unresolvedOrigAddrs.length} unresolved addresses`
-        );
         try {
           const { stdout: romStdout } = await execFileAsync(
             addr2linePath, ['-fiaC', '-e', romElfPath, ...unresolvedOrigAddrs], { timeout: 15000 }
@@ -915,7 +955,6 @@ async function resolveAddressesViaGdb(
 
   try {
     const { stdout } = await execFileAsync(gdbPath, exArgs, { timeout: 15000 });
-    log?.appendLine(`[ESP Decoder] GDB batch resolve: ${stdout.length} chars output for ${addrs.length} addresses`);
 
     const frames: StackFrame[] = [];
     const sections = stdout.split(/^>>>(0x[0-9a-fA-F]+)$/m);
@@ -968,6 +1007,7 @@ async function enhanceWithHeuristicStackFrames(
   toolPath: string,
   log?: DecodeLogger,
   romElfPath?: string,
+  pool?: Addr2linePool,
 ): Promise<void> {
   const write = (msg: string) => log?.appendLine(msg);
 
@@ -975,34 +1015,21 @@ async function enhanceWithHeuristicStackFrames(
   const candidateAddrs = extractAllCandidateAddresses(crashEvent.rawText);
 
   if (candidateAddrs.length === 0) {
-    write?.('[ESP Decoder] RISC-V heuristic: no candidate code addresses found in crash text');
     return;
   }
-
-  write?.(
-    `[ESP Decoder] RISC-V heuristic: found ${candidateAddrs.length} candidate addresses — resolving via addr2line`
-  );
 
   // Prefer addr2line (fast) — fall back to GDB batch if not found
   let heuristicFrames: StackFrame[] = [];
   const addr2linePath = deriveAddr2linePath(toolPath, log);
 
   if (addr2linePath) {
-    write?.(`[ESP Decoder] Using addr2line for heuristic resolution: ${addr2linePath}`);
-    heuristicFrames = await resolveAddressesViaAddr2line(candidateAddrs, elfPath, addr2linePath, log, romElfPath);
+    heuristicFrames = await resolveAddressesViaAddr2line(candidateAddrs, elfPath, addr2linePath, log, romElfPath, pool);
   } else {
-    write?.('[ESP Decoder] addr2line not found — falling back to GDB batch mode');
     heuristicFrames = await resolveAddressesViaGdb(candidateAddrs, elfPath, toolPath, log);
   }
 
   if (heuristicFrames.length > 0) {
-    write?.(
-      `[ESP Decoder] Heuristic: resolved ${heuristicFrames.length} frames from crash text`
-    );
-    // Replace the stacktrace with the comprehensive addr2line results
     decoded.stacktrace = heuristicFrames;
-  } else {
-    write?.('[ESP Decoder] Heuristic: no candidate addresses resolved to known functions');
   }
 }
 
@@ -1202,11 +1229,65 @@ async function resolveRegisterAddresses(
     }
   }
 
-  log?.appendLine(
-    `[ESP Decoder] Register annotations: ${Object.keys(annotations).length} of ${Object.keys(regs).length} registers resolved`
-  );
-
   return annotations;
+}
+
+/**
+ * Extract PC addresses from Xtensa-style backtrace lines.
+ * Format: "Backtrace: 0xPC:0xSP 0xPC:0xSP ..."
+ */
+function extractXtensaBacktraceAddresses(text: string): string[] {
+  const btMatch = text.match(/Backtrace:\s*((?:0x[0-9a-fA-F]+:0x[0-9a-fA-F]+\s*)+)/i);
+  if (!btMatch) { return []; }
+  const pairs = btMatch[1].trim().split(/\s+/);
+  const addresses: string[] = [];
+  for (const pair of pairs) {
+    const pc = pair.split(':')[0];
+    if (pc && /^0x[0-9a-fA-F]+$/i.test(pc)) {
+      addresses.push(pc.toLowerCase());
+    }
+  }
+  return addresses;
+}
+
+/**
+ * Parse Xtensa-specific fault information including EXCVADDR/EXCCAUSE.
+ */
+function parseXtensaFaultInfo(text: string): DecodedCrash['faultInfo'] | undefined {
+  const lines = text.split('\n');
+  let coreId = 0;
+  let faultMessage: string | undefined;
+  let programCounter: string | undefined;
+  let faultAddr: string | undefined;
+  let faultCode: number | undefined;
+
+  for (const line of lines) {
+    const guruMatch = line.match(/Core\s+(\d+)\s+panic'ed\s+\(([^)]+)\)/i);
+    if (guruMatch) {
+      coreId = parseInt(guruMatch[1], 10);
+      faultMessage = guruMatch[2];
+    }
+    const pcMatch = line.match(/\bPC\s*[:=]\s*(0x[0-9a-fA-F]+)/i);
+    if (pcMatch && !programCounter) { programCounter = pcMatch[1]; }
+    const excvMatch = line.match(/\bEXCVADDR\s*[:=]\s*(0x[0-9a-fA-F]+)/i);
+    if (excvMatch) { faultAddr = excvMatch[1]; }
+    const exccMatch = line.match(/\bEXCCAUSE\s*[:=]\s*(0x[0-9a-fA-F]+)/i);
+    if (exccMatch) { faultCode = parseInt(exccMatch[1], 16); }
+  }
+
+  if (faultCode !== undefined && faultCode < XTENSA_EXCEPTIONS.length) {
+    const desc = XTENSA_EXCEPTIONS[faultCode];
+    if (desc && !faultMessage) {
+      faultMessage = desc;
+    } else if (desc && faultMessage) {
+      faultMessage = `${faultMessage} (${desc})`;
+    }
+  }
+
+  if (faultMessage || programCounter) {
+    return { coreId, programCounter, faultAddr, faultCode, faultMessage };
+  }
+  return undefined;
 }
 
 /**
