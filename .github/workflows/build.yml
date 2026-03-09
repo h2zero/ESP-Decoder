@@ -55,3 +55,6 @@ jobs:
           npm run package
       - name: Publish to VS Code Marketplace
         run: npx vsce publish -p ${{ secrets.VSCE_TOKEN }}
+        env:
+          VSCE_TOKEN: ${{ secrets.VSCE_TOKEN }}
+
