@@ -632,23 +632,25 @@ export class EspDecoderWebviewPanel {
     /* Scroll-to-bottom button */
     #btn-scroll-bottom {
       position: absolute;
-      bottom: 48px;
-      right: 16px;
+      bottom: 56px;
+      left: 50%;
+      transform: translateX(-50%);
       z-index: 10;
-      background: var(--btn-secondary-bg);
-      color: var(--btn-secondary-fg);
-      border: 1px solid var(--border);
-      border-radius: 50%;
-      width: 32px;
-      height: 32px;
-      padding: 0;
-      font-size: 16px;
-      line-height: 1;
+      background: var(--btn-bg);
+      color: var(--btn-fg);
+      border: none;
+      border-radius: 20px;
+      padding: 6px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
       cursor: pointer;
-      opacity: 0.85;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
       display: none;
+      white-space: nowrap;
+      transition: background 0.15s, box-shadow 0.15s;
     }
-    #btn-scroll-bottom:hover { opacity: 1; background: var(--btn-hover); color: var(--btn-fg); }
+    #btn-scroll-bottom:hover { background: var(--btn-hover); box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
 
     /* Serial Monitor */
     #serial-output {
@@ -993,7 +995,7 @@ export class EspDecoderWebviewPanel {
   <!-- Serial Monitor Panel -->
   <div class="panel active" id="panel-serial" style="position:relative">
     <div id="serial-output"></div>
-    <button id="btn-scroll-bottom" title="Scroll to bottom">&#8595;</button>
+    <button id="btn-scroll-bottom" title="Scroll to bottom">&#8595; Scroll to bottom</button>
     <div class="serial-input-row">
       <input type="text" id="serial-input" placeholder="Type command and press Enter..."
         autocomplete="off" spellcheck="false" />
@@ -1038,9 +1040,6 @@ export class EspDecoderWebviewPanel {
     let crashCount = 0;
     // Guards against scheduling multiple requestAnimationFrame callbacks for scrolling.
     let scrollRAFPending = false;
-    // Set to true while a programmatic scrollTop assignment is in flight so the
-    // resulting scroll event does not incorrectly toggle autoscroll off.
-    let programmaticScroll = false;
 
     function updateScrollButton() {
       btnScrollBottom.style.display = autoscroll ? 'none' : 'block';
@@ -1155,13 +1154,6 @@ export class EspDecoderWebviewPanel {
 
     // Auto-scroll detection
     serialOutput.addEventListener('scroll', () => {
-      // Ignore scroll events that we triggered programmatically so they cannot
-      // accidentally flip autoscroll off (e.g. when new data arrives between the
-      // RAF assignment and the resulting scroll event, pushing scrollHeight further).
-      if (programmaticScroll) {
-        programmaticScroll = false;
-        return;
-      }
       const el = serialOutput;
       autoscroll = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
       updateScrollButton();
@@ -1169,10 +1161,9 @@ export class EspDecoderWebviewPanel {
 
     // Scroll-to-bottom button
     btnScrollBottom.addEventListener('click', () => {
+      serialOutput.scrollTop = serialOutput.scrollHeight;
       autoscroll = true;
       updateScrollButton();
-      programmaticScroll = true;
-      serialOutput.scrollTop = serialOutput.scrollHeight;
     });
 
     // Message handler
@@ -1227,7 +1218,6 @@ export class EspDecoderWebviewPanel {
         requestAnimationFrame(() => {
           scrollRAFPending = false;
           if (autoscroll) {
-            programmaticScroll = true;
             serialOutput.scrollTop = serialOutput.scrollHeight;
           }
         });
@@ -1256,7 +1246,6 @@ export class EspDecoderWebviewPanel {
         requestAnimationFrame(() => {
           scrollRAFPending = false;
           if (autoscroll) {
-            programmaticScroll = true;
             serialOutput.scrollTop = serialOutput.scrollHeight;
           }
         });
