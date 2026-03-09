@@ -629,6 +629,27 @@ export class EspDecoderWebviewPanel {
     }
     .panel.active { display: flex; flex-direction: column; }
 
+    /* Scroll-to-bottom button */
+    #btn-scroll-bottom {
+      position: absolute;
+      bottom: 48px;
+      right: 16px;
+      z-index: 10;
+      background: var(--btn-secondary-bg);
+      color: var(--btn-secondary-fg);
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      width: 32px;
+      height: 32px;
+      padding: 0;
+      font-size: 16px;
+      line-height: 1;
+      cursor: pointer;
+      opacity: 0.85;
+      display: none;
+    }
+    #btn-scroll-bottom:hover { opacity: 1; background: var(--btn-hover); color: var(--btn-fg); }
+
     /* Serial Monitor */
     #serial-output {
       flex: 1;
@@ -970,8 +991,9 @@ export class EspDecoderWebviewPanel {
   </div>
 
   <!-- Serial Monitor Panel -->
-  <div class="panel active" id="panel-serial">
+  <div class="panel active" id="panel-serial" style="position:relative">
     <div id="serial-output"></div>
+    <button id="btn-scroll-bottom" title="Scroll to bottom">&#8595;</button>
     <div class="serial-input-row">
       <input type="text" id="serial-input" placeholder="Type command and press Enter..."
         autocomplete="off" spellcheck="false" />
@@ -1009,12 +1031,18 @@ export class EspDecoderWebviewPanel {
     const crashList = document.getElementById('crash-list');
     const noCrashes = document.getElementById('no-crashes');
     const crashCountBadge = document.getElementById('crash-count');
+    const btnScrollBottom = document.getElementById('btn-scroll-bottom');
 
     let connected = false;
     let autoscroll = true;
     let crashCount = 0;
     // Guards against scheduling multiple requestAnimationFrame callbacks for scrolling.
     let scrollRAFPending = false;
+
+    function updateScrollButton() {
+      btnScrollBottom.style.display = autoscroll ? 'none' : 'block';
+    }
+    updateScrollButton();
 
     // Tab switching
     document.querySelectorAll('.tab').forEach(tab => {
@@ -1126,6 +1154,14 @@ export class EspDecoderWebviewPanel {
     serialOutput.addEventListener('scroll', () => {
       const el = serialOutput;
       autoscroll = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+      updateScrollButton();
+    });
+
+    // Scroll-to-bottom button
+    btnScrollBottom.addEventListener('click', () => {
+      serialOutput.scrollTop = serialOutput.scrollHeight;
+      autoscroll = true;
+      updateScrollButton();
     });
 
     // Message handler
