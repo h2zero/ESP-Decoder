@@ -26,6 +26,15 @@ export class EspDecoderWebviewPanel {
   private lineBuffer = '';
   private config: SessionConfig = {};
 
+  // Batch serial data before posting to the webview to prevent message-queue flooding.
+  // Without batching, a device sending data at 921600 baud can produce thousands of
+  // postMessage() calls per second, saturating the IPC queue.  Even after the device
+  // is disconnected the accumulated queue takes minutes to drain, causing the terminal
+  // to keep printing long after the port is closed.
+  private pendingSerialData = '';
+  private serialFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SERIAL_FLUSH_INTERVAL_MS = 50;
+
   public static createOrShow(
     extensionUri: vscode.Uri,
     serialManager: SerialPortManager,
@@ -111,6 +120,12 @@ export class EspDecoderWebviewPanel {
     // Listen to connection changes
     this.disposables.push(
       this.serialManager.onConnectionChange((connected) => {
+        if (!connected) {
+          // Cancel the pending serial-data flush and discard any buffered bytes.
+          // This prevents a large backlog of queued IPC messages from continuing
+          // to drain into the webview for minutes after the device is unplugged.
+          this.cancelSerialFlush();
+        }
         this.postMessage({
           type: 'connectionChanged',
           connected,
@@ -205,8 +220,16 @@ export class EspDecoderWebviewPanel {
   private handleSerialData(data: Buffer): void {
     const text = data.toString('utf8');
 
-    // Feed raw text to webview
-    this.postMessage({ type: 'serialData', data: text });
+    // Buffer outgoing display data and flush in batches.  Posting every raw
+    // chunk as a separate IPC message can produce thousands of messages per
+    // second at high baud rates, saturating the webview message queue.
+    this.pendingSerialData += text;
+    if (this.serialFlushTimer === null) {
+      this.serialFlushTimer = setTimeout(
+        () => this.flushSerialData(),
+        EspDecoderWebviewPanel.SERIAL_FLUSH_INTERVAL_MS
+      );
+    }
 
     // Feed raw bytes to trbr's capturer for crash detection.
     // trbr handles line decoding, crash framing (including Stack memory:
@@ -228,10 +251,35 @@ export class EspDecoderWebviewPanel {
       this.serialLines.push(line);
     }
 
-    // Trim serial lines
-    while (this.serialLines.length > maxLines) {
-      this.serialLines.shift();
+    // Trim serial lines.  Reassigning to a slice is O(k) and avoids mutating
+    // a large array in-place, which is clearer and avoids the risk of GC
+    // pressure from holding stale references in the old tail.
+    if (this.serialLines.length > maxLines) {
+      this.serialLines = this.serialLines.slice(-maxLines);
     }
+  }
+
+  /** Send accumulated serial bytes to the webview in one IPC message. */
+  private flushSerialData(): void {
+    this.serialFlushTimer = null;
+    if (this.pendingSerialData) {
+      this.postMessage({ type: 'serialData', data: this.pendingSerialData });
+      this.pendingSerialData = '';
+    }
+  }
+
+  /**
+   * Cancel the pending serial-data flush timer and discard buffered bytes.
+   * Called on disconnect so that data accumulated in the buffer just before
+   * the port closed is not forwarded to the webview.
+   */
+  private cancelSerialFlush(): void {
+    if (this.serialFlushTimer !== null) {
+      clearTimeout(this.serialFlushTimer);
+      this.serialFlushTimer = null;
+    }
+    this.pendingSerialData = '';
+    this.lineBuffer = '';
   }
 
   private async handleMessage(message: any): Promise<void> {
@@ -309,6 +357,7 @@ export class EspDecoderWebviewPanel {
         }
         break;
       case 'clear':
+        this.cancelSerialFlush();
         this.serialLines = [];
         this.crashEvents = [];
         this.crashCapturer.reset();
@@ -403,6 +452,7 @@ export class EspDecoderWebviewPanel {
 
   public dispose(): void {
     EspDecoderWebviewPanel.currentPanel = undefined;
+    this.cancelSerialFlush();
     this.crashCapturer.dispose();
     this.addr2linePool.disposeAll();
     this.panel.dispose();
@@ -580,6 +630,29 @@ export class EspDecoderWebviewPanel {
       display: none;
     }
     .panel.active { display: flex; flex-direction: column; }
+
+    /* Scroll-to-bottom button */
+    #btn-scroll-bottom {
+      position: absolute;
+      bottom: 56px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      background: var(--btn-bg);
+      color: var(--btn-fg);
+      border: none;
+      border-radius: 20px;
+      padding: 6px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1.4;
+      cursor: pointer;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+      display: none;
+      white-space: nowrap;
+      transition: background 0.15s, box-shadow 0.15s;
+    }
+    #btn-scroll-bottom:hover { background: var(--btn-hover); box-shadow: 0 4px 12px rgba(0,0,0,0.5); }
 
     /* Serial Monitor */
     #serial-output {
@@ -922,8 +995,9 @@ export class EspDecoderWebviewPanel {
   </div>
 
   <!-- Serial Monitor Panel -->
-  <div class="panel active" id="panel-serial">
+  <div class="panel active" id="panel-serial" style="position:relative">
     <div id="serial-output"></div>
+    <button id="btn-scroll-bottom" title="Scroll to bottom">&#8595; Scroll to bottom</button>
     <div class="serial-input-row">
       <input type="text" id="serial-input" placeholder="Type command and press Enter..."
         autocomplete="off" spellcheck="false" />
@@ -961,10 +1035,21 @@ export class EspDecoderWebviewPanel {
     const crashList = document.getElementById('crash-list');
     const noCrashes = document.getElementById('no-crashes');
     const crashCountBadge = document.getElementById('crash-count');
+    const btnScrollBottom = document.getElementById('btn-scroll-bottom');
 
     let connected = false;
     let autoscroll = true;
     let crashCount = 0;
+    // Guards against scheduling multiple requestAnimationFrame callbacks for scrolling.
+    let scrollRAFPending = false;
+    // Prevents programmatic scrollTop assignments from being misread as user
+    // scroll events and accidentally disabling autoscroll (race at high baud rates).
+    let programmaticScroll = false;
+
+    function updateScrollButton() {
+      btnScrollBottom.style.display = autoscroll ? 'none' : 'block';
+    }
+    updateScrollButton();
 
     // Tab switching
     document.querySelectorAll('.tab').forEach(tab => {
@@ -1074,8 +1159,24 @@ export class EspDecoderWebviewPanel {
 
     // Auto-scroll detection
     serialOutput.addEventListener('scroll', () => {
+      // Ignore scroll events fired by our own scrollTop assignments so they
+      // cannot flip autoscroll off when new data arrives between the RAF
+      // assignment and the resulting scroll event (race at high baud rates).
+      if (programmaticScroll) {
+        programmaticScroll = false;
+        return;
+      }
       const el = serialOutput;
       autoscroll = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+      updateScrollButton();
+    });
+
+    // Scroll-to-bottom button
+    btnScrollBottom.addEventListener('click', () => {
+      autoscroll = true;
+      updateScrollButton();
+      programmaticScroll = true;
+      serialOutput.scrollTop = serialOutput.scrollHeight;
     });
 
     // Message handler
@@ -1125,8 +1226,15 @@ export class EspDecoderWebviewPanel {
       span.style.color = 'var(--error-fg)';
       span.textContent = '[ERROR] ' + text + '\\n';
       serialOutput.appendChild(span);
-      if (autoscroll) {
-        serialOutput.scrollTop = serialOutput.scrollHeight;
+      if (autoscroll && !scrollRAFPending) {
+        scrollRAFPending = true;
+        requestAnimationFrame(() => {
+          scrollRAFPending = false;
+          if (autoscroll) {
+            programmaticScroll = true;
+            serialOutput.scrollTop = serialOutput.scrollHeight;
+          }
+        });
       }
     }
 
@@ -1135,13 +1243,27 @@ export class EspDecoderWebviewPanel {
       span.textContent = text;
       serialOutput.appendChild(span);
 
-      // Trim if too many nodes
-      while (serialOutput.childNodes.length > 10000) {
-        serialOutput.removeChild(serialOutput.firstChild);
+      // Trim excess nodes in a single DOM operation.  replaceChildren() with
+      // only the nodes to keep is faster than removing excess nodes one-by-one
+      // because it triggers a single layout invalidation instead of one per call.
+      const excess = serialOutput.childNodes.length - 10000;
+      if (excess > 0) {
+        const keep = Array.from(serialOutput.childNodes).slice(excess);
+        serialOutput.replaceChildren(...keep);
       }
 
-      if (autoscroll) {
-        serialOutput.scrollTop = serialOutput.scrollHeight;
+      // Schedule a single autoscroll per animation frame to avoid forcing a
+      // layout reflow on every incoming message (which is very expensive at
+      // high baud rates and causes the terminal to slow down significantly).
+      if (autoscroll && !scrollRAFPending) {
+        scrollRAFPending = true;
+        requestAnimationFrame(() => {
+          scrollRAFPending = false;
+          if (autoscroll) {
+            programmaticScroll = true;
+            serialOutput.scrollTop = serialOutput.scrollHeight;
+          }
+        });
       }
     }
 
@@ -1313,7 +1435,7 @@ export class EspDecoderWebviewPanel {
             html += '<span class="reg-name">' + escapeHtml(name) + '</span>';
             html += '<span class="reg-value">0x' + Number(value).toString(16).padStart(8, '0') + '</span>';
             if (annotation) {
-              html += '<span class="reg-annotation">' + escapeHtml(annotation) + '</span>';
+              html += '<span class="reg-annotation">' + formatAnnotation(annotation) + '</span>';
             }
             html += '</div>';
           }
@@ -1336,7 +1458,7 @@ export class EspDecoderWebviewPanel {
       if (decoded.rawOutput) {
         html += '<div class="crash-section">';
         html += '<div class="crash-section-title">Decoded Output</div>';
-        html += '<div class="raw-output">' + escapeHtml(decoded.rawOutput) + '</div>';
+        html += '<div class="raw-output">' + linkifyPaths(decoded.rawOutput) + '</div>';
         html += '</div>';
       }
 
@@ -1362,6 +1484,42 @@ export class EspDecoderWebviewPanel {
 
     function openFile(file, line) {
       vscode.postMessage({ type: 'openFile', file, line });
+    }
+
+    function linkifyPaths(text) {
+      // Run the regex against the raw (unescaped) text so that captured file
+      // paths used in data-file attributes are not corrupted by HTML entities.
+      var result = '';
+      var lastIndex = 0;
+      var re = /(\/[\w.\-\/]+\.\w+):(\d+)/g;
+      var m;
+      while ((m = re.exec(text)) !== null) {
+        result += escapeHtml(text.slice(lastIndex, m.index));
+        var file = m[1];
+        var line = m[2];
+        var shortFile = file.split('/').pop();
+        result += '<span class="frame-file" data-file="' +
+          escapeAttr(file) + '" data-line="' + escapeAttr(line) +
+          '">' + escapeHtml(shortFile + ':' + line) + '</span>';
+        lastIndex = re.lastIndex;
+      }
+      result += escapeHtml(text.slice(lastIndex));
+      return result;
+    }
+
+    function formatAnnotation(annotation) {
+      // Parse "func_name at /path/to/file.c:123" into clickable link
+      var match = annotation.match(/^(.+?)\\s+at\\s+(.+?):(\\d+)$/);
+      if (match) {
+        var func = match[1];
+        var file = match[2];
+        var line = match[3];
+        var shortFile = file.split('/').pop();
+        return escapeHtml(func) + ' at <span class="frame-file" data-file="' +
+          escapeAttr(file) + '" data-line="' + escapeAttr(line) +
+          '">' + escapeHtml(shortFile + ':' + line) + '</span>';
+      }
+      return escapeHtml(annotation);
     }
 
     function escapeHtml(text) {
