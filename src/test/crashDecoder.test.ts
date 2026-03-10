@@ -45,8 +45,9 @@ vi.mock('vscode', () => {
 // ---------------------------------------------------------------------------
 // Import under test (after vscode mock is in place)
 // ---------------------------------------------------------------------------
-import { TrbrCrashCapturer, decodeCrash } from '../crashDecoder.js';
-import type { CrashEvent } from '../crashDecoder.js';
+import { TrbrCrashCapturer, decodeCrash, decodeCoredumpElf, decodeCoredumpBase64, containsBase64Coredump } from '../crashDecoder.js';
+import type { CrashEvent, CoredumpDecodedResult } from '../crashDecoder.js';
+import { getPioPackagesDir } from '../pioIntegration.js';
 
 // ---------------------------------------------------------------------------
 // Fixture paths
@@ -57,8 +58,53 @@ const CRASH_TEXT_PATH = path.join(FIXTURES_DIR, 'esp32c6_assert.txt');
 
 const CRASH_TEXT = fs.readFileSync(CRASH_TEXT_PATH, 'utf8');
 
-// Resolved from PlatformIO packages on this machine
-const GDB_PATH = '/Users/claudia/.platformio/packages/tool-riscv32-esp-elf-gdb/bin/riscv32-esp-elf-gdb';
+// ESP32 coredump b64 test fixtures
+// Source: https://github.com/espressif/esp-coredump/tree/master/tests/esp32
+const B64_COREDUMP_PATH = path.join(FIXTURES_DIR, 'coredump_esp32.b64');
+const ESP32_FIRMWARE_ELF_PATH = path.join(FIXTURES_DIR, 'esp32_coredump_firmware.elf');
+
+// Resolve GDB paths from PlatformIO packages (works on any machine)
+function findPioGdb(kind: 'riscv' | 'xtensa'): string | undefined {
+  const pioDir = getPioPackagesDir();
+  if (!pioDir) { return undefined; }
+  const ext = process.platform === 'win32' ? '.exe' : '';
+  if (kind === 'riscv') {
+    const candidates = [
+      path.join(pioDir, 'tool-riscv32-esp-elf-gdb', 'bin', `riscv32-esp-elf-gdb${ext}`),
+      path.join(pioDir, 'toolchain-riscv32-esp', 'bin', `riscv32-esp-elf-gdb${ext}`),
+    ];
+    return candidates.find(c => fs.existsSync(c));
+  }
+  const xtensaVariants = [
+    { pkg: 'tool-xtensa-esp-elf-gdb', bin: `xtensa-esp32-elf-gdb${ext}` },
+    { pkg: 'tool-xtensa-esp-elf-gdb', bin: `xtensa-esp32s3-elf-gdb${ext}` },
+    { pkg: 'tool-xtensa-esp-elf-gdb', bin: `xtensa-esp32s2-elf-gdb${ext}` },
+    { pkg: 'toolchain-xtensa-esp-elf', bin: `xtensa-esp-elf-gdb${ext}` },
+    { pkg: 'toolchain-xtensa-esp32s3-elf', bin: `xtensa-esp32s3-elf-gdb${ext}` },
+    { pkg: 'toolchain-xtensa-esp32-elf', bin: `xtensa-esp32-elf-gdb${ext}` },
+    { pkg: 'toolchain-xtensa-esp32s2-elf', bin: `xtensa-esp32s2-elf-gdb${ext}` },
+  ];
+  for (const { pkg, bin } of xtensaVariants) {
+    const c = path.join(pioDir, pkg, 'bin', bin);
+    if (fs.existsSync(c)) { return c; }
+  }
+  try {
+    for (const entry of fs.readdirSync(pioDir)) {
+      if (entry.startsWith('tool-xtensa') && entry.includes('-gdb')) {
+        const binDir = path.join(pioDir, entry, 'bin');
+        for (const bin of fs.readdirSync(binDir)) {
+          if (/^xtensa-.*-elf-gdb(\.exe)?$/.test(bin)) {
+            return path.join(binDir, bin);
+          }
+        }
+      }
+    }
+  } catch {}
+  return undefined;
+}
+
+const GDB_PATH = process.env.ESP_RISCV_GDB ?? findPioGdb('riscv') ?? '';
+const XTENSA_GDB_PATH = process.env.ESP_XTENSA_GDB ?? findPioGdb('xtensa') ?? '';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -215,4 +261,119 @@ describe('decodeCrash – ESP32-C6 with real ELF', () => {
       expect(mepc).toBe(0x4080c1aa);
     }
   );
+});
+
+describe('decodeCoredumpElf', () => {
+  it('exports as a function', () => {
+    expect(typeof decodeCoredumpElf).toBe('function');
+  });
+
+  it('gracefully handles missing toolPath by returning empty result', async () => {
+    // When toolPath doesn't exist and auto-detection fails, should not throw
+    const result = await decodeCoredumpElf(
+      '/nonexistent/coredump.elf',
+      '/nonexistent/firmware.elf',
+      undefined, // no toolPath — auto-detect will fail
+      'esp32c6',
+    );
+    expect(result).toBeDefined();
+    expect(Array.isArray(result.threads)).toBe(true);
+    expect(result.threads).toHaveLength(0);
+    expect(typeof result.rawOutput).toBe('string');
+  });
+
+  it.skipIf(!fs.existsSync(B64_COREDUMP_PATH) || !fs.existsSync(ESP32_FIRMWARE_ELF_PATH) || !fs.existsSync(XTENSA_GDB_PATH))(
+    'decodes an esp32 b64 coredump file with multiple threads',
+    async () => {
+      const result = await decodeCoredumpElf(
+        B64_COREDUMP_PATH,
+        ESP32_FIRMWARE_ELF_PATH,
+        XTENSA_GDB_PATH,
+        'xtensa',
+      );
+
+      expect(result).toBeDefined();
+      expect(result.threads.length).toBeGreaterThan(0);
+
+      // At least one thread should be flagged as the current/crashed thread
+      const currentThread = result.threads.find(t => t.isCurrent);
+      expect(currentThread).toBeDefined();
+
+      // The crashed thread should have stacktrace frames
+      expect(currentThread!.decoded.stacktrace.length).toBeGreaterThan(0);
+    },
+    60_000,
+  );
+});
+
+describe('containsBase64Coredump', () => {
+  it('detects CORE DUMP START/END markers', () => {
+    const text = [
+      'some serial output',
+      '================= CORE DUMP START =================',
+      'f0VMRgEBAQAAAAAAAAAAAAQAXgABAAAA',
+      'AAAAAA==',
+      '================= CORE DUMP END ===================',
+      'Rebooting...',
+    ].join('\n');
+    expect(containsBase64Coredump(text)).toBe(true);
+  });
+
+  it('returns false for regular crash text', () => {
+    expect(containsBase64Coredump(CRASH_TEXT)).toBe(false);
+  });
+
+  it('returns false for empty string', () => {
+    expect(containsBase64Coredump('')).toBe(false);
+  });
+
+  it.skipIf(!fs.existsSync(B64_COREDUMP_PATH))(
+    'detects markerless b64 coredump file content',
+    () => {
+      const b64Content = fs.readFileSync(B64_COREDUMP_PATH, 'utf-8');
+      expect(containsBase64Coredump(b64Content)).toBe(true);
+    },
+  );
+});
+
+describe('decodeCoredumpBase64', () => {
+  it('exports as a function', () => {
+    expect(typeof decodeCoredumpBase64).toBe('function');
+  });
+
+  it.skipIf(!fs.existsSync(B64_COREDUMP_PATH) || !fs.existsSync(ESP32_FIRMWARE_ELF_PATH) || !fs.existsSync(XTENSA_GDB_PATH))(
+    'decodes b64 text with CORE DUMP markers wrapping esp32 coredump',
+    async () => {
+      const b64Content = fs.readFileSync(B64_COREDUMP_PATH, 'utf-8');
+      const markerWrapped = [
+        'I (1234) esp_core_dump_flash: Found partition on flash',
+        '================= CORE DUMP START =================',
+        b64Content,
+        '================= CORE DUMP END ===================',
+        '',
+      ].join('\n');
+
+      const result = await decodeCoredumpBase64(
+        markerWrapped,
+        ESP32_FIRMWARE_ELF_PATH,
+        XTENSA_GDB_PATH,
+        'xtensa',
+      );
+
+      expect(result).toBeDefined();
+      expect(result.threads.length).toBeGreaterThan(0);
+    },
+    60_000,
+  );
+
+  it('returns empty threads for invalid b64 content', async () => {
+    const result = await decodeCoredumpBase64(
+      'not valid base64 content!!!',
+      '/nonexistent/firmware.elf',
+      undefined,
+      'xtensa',
+    );
+    expect(result).toBeDefined();
+    expect(result.threads).toHaveLength(0);
+  });
 });

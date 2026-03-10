@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as os from 'os';
 import * as fs from 'fs';
+import * as fsPromises from 'fs/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -19,6 +21,7 @@ import type {
   Capturer,
   CapturerEvent,
   DecodeOptions,
+  CoredumpDecodeResult,
 } from 'trbr';
 import { getPioPackagesDir } from './pioIntegration';
 import { Addr2linePool } from './addr2lineResolver';
@@ -64,6 +67,21 @@ export interface StackFrame {
   function?: string;
   file?: string;
   line?: string;
+}
+
+/**
+ * Decoded coredump with per-thread crash information.
+ */
+export interface CoredumpDecodedResult {
+  threads: ThreadDecodedCrash[];
+  rawOutput: string;
+}
+
+export interface ThreadDecodedCrash {
+  threadId: string;
+  threadName?: string;
+  isCurrent?: boolean;
+  decoded: DecodedCrash;
 }
 
 /**
@@ -417,6 +435,322 @@ export async function decodeCrash(
 }
 
 /**
+ * Decode an ESP coredump file using trbr's coredump mode.
+ * Supports both ELF format and base64-encoded (b64) format.
+ * For b64 files, the content is decoded to a temporary ELF file before passing
+ * to trbr. The b64 format is used by ESP-IDF's esp-coredump tool and may
+ * contain serial markers (CORE DUMP START / CORE DUMP END).
+ *
+ * @param coredumpPath - Path to the coredump file (ELF or b64)
+ * @param elfPath - Path to the firmware ELF file (with debug symbols)
+ * @param toolPath - Optional path to GDB binary
+ * @param targetArch - Optional target architecture
+ * @param log - Optional logger
+ */
+export async function decodeCoredumpElf(
+  coredumpPath: string,
+  elfPath: string,
+  toolPath?: string,
+  targetArch?: string,
+  log?: DecodeLogger,
+): Promise<CoredumpDecodedResult> {
+  const write = (msg: string) => log?.appendLine(msg);
+
+  // Detect whether the file is b64-encoded and convert if necessary
+  const resolvedPath = await resolveCoredumpPath(coredumpPath, log);
+  const needsCleanup = resolvedPath !== coredumpPath;
+
+  try {
+    return await decodeCoredumpElfInternal(resolvedPath, elfPath, toolPath, targetArch, log);
+  } finally {
+    if (needsCleanup) {
+      // Clean up temporary decoded file
+      try {
+        await fsPromises.unlink(resolvedPath);
+        const tmpDir = path.dirname(resolvedPath);
+        await fsPromises.rmdir(tmpDir).catch(() => {});
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  }
+}
+
+/**
+ * Decode a base64-encoded coredump from raw text content (e.g. pasted from serial).
+ * Extracts the base64 payload (optionally between CORE DUMP START/END markers),
+ * decodes it, and passes the resulting ELF to trbr's coredump decoder.
+ *
+ * @param b64Content - Base64-encoded coredump text (with or without markers)
+ * @param elfPath - Path to the firmware ELF file (with debug symbols)
+ * @param toolPath - Optional path to GDB binary
+ * @param targetArch - Optional target architecture
+ * @param log - Optional logger
+ */
+export async function decodeCoredumpBase64(
+  b64Content: string,
+  elfPath: string,
+  toolPath?: string,
+  targetArch?: string,
+  log?: DecodeLogger,
+): Promise<CoredumpDecodedResult> {
+  const write = (msg: string) => log?.appendLine(msg);
+
+  const binary = decodeBase64Payload(b64Content);
+  if (!binary) {
+    write('[ESP Decoder] No valid base64 coredump content found');
+    return {
+      threads: [],
+      rawOutput: 'No valid base64 coredump content found in the provided text.',
+    };
+  }
+
+  // Write decoded binary to temp file
+  const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'esp-coredump-'));
+  const tmpPath = path.join(tmpDir, 'coredump.elf');
+  try {
+    await fsPromises.writeFile(tmpPath, binary);
+    write(`[ESP Decoder] Decoded b64 coredump to temp file: ${tmpPath} (${binary.length} bytes)`);
+
+    return await decodeCoredumpElfInternal(tmpPath, elfPath, toolPath, targetArch, log);
+  } finally {
+    try {
+      await fsPromises.unlink(tmpPath);
+      await fsPromises.rmdir(tmpDir).catch(() => {});
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+/**
+ * Check whether text contains an ESP coredump in base64 format.
+ * Matches either:
+ *  - CORE DUMP START/END markers from ESP-IDF serial output, or
+ *  - a markerless block of base64 lines whose decoded payload contains an ELF core.
+ */
+export function containsBase64Coredump(text: string): boolean {
+  if (COREDUMP_START_RE.test(text) && COREDUMP_END_RE.test(text)) {
+    return true;
+  }
+
+  // Markerless detection: at least 10 consecutive base64 lines that decode to
+  // a buffer containing ELF magic (possibly after an esp-coredump header).
+  const base64Lines = text
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && /^[A-Za-z0-9+/=]+$/.test(l));
+  if (base64Lines.length < 10) {
+    return false;
+  }
+  try {
+    const buffers = base64Lines.map(l => Buffer.from(l, 'base64'));
+    const binary = Buffer.concat(buffers);
+    return binary.indexOf(ELF_MAGIC) >= 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Regex for ESP-IDF coredump serial markers */
+const COREDUMP_START_RE = /={10,}\s*CORE\s+DUMP\s+START\s*={10,}/;
+const COREDUMP_END_RE = /={10,}\s*CORE\s+DUMP\s+END\s*={10,}/;
+
+/** ELF magic bytes: \x7fELF */
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+
+/**
+ * Detect whether a coredump file is base64-encoded and convert to a temp ELF if so.
+ * Returns the original path if already ELF, or a temp path if converted.
+ */
+async function resolveCoredumpPath(
+  coredumpPath: string,
+  log?: DecodeLogger,
+): Promise<string> {
+  const write = (msg: string) => log?.appendLine(msg);
+
+  let fd;
+  try {
+    fd = await fsPromises.open(coredumpPath, 'r');
+  } catch {
+    // File doesn't exist or isn't readable — return as-is and let the caller handle the error
+    return coredumpPath;
+  }
+  try {
+    const header = Buffer.alloc(4);
+    await fd.read(header, 0, 4, 0);
+
+    if (header.compare(ELF_MAGIC, 0, 4, 0, 4) === 0) {
+      // Already an ELF file
+      return coredumpPath;
+    }
+  } finally {
+    await fd.close();
+  }
+
+  // Not ELF — assume base64-encoded
+  write(`[ESP Decoder] File does not start with ELF magic, treating as b64: ${coredumpPath}`);
+  const raw = await fsPromises.readFile(coredumpPath, 'utf-8');
+  const binary = decodeBase64Payload(raw);
+  if (!binary) {
+    write('[ESP Decoder] Could not extract base64 payload — passing file as-is');
+    return coredumpPath;
+  }
+
+  const tmpDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'esp-coredump-'));
+  const tmpPath = path.join(tmpDir, 'coredump.elf');
+  await fsPromises.writeFile(tmpPath, binary);
+  write(`[ESP Decoder] Decoded b64 coredump to temp ELF: ${tmpPath} (${binary.length} bytes)`);
+  return tmpPath;
+}
+
+/**
+ * Decode base64 payload from text, stripping optional CORE DUMP START/END markers.
+ * Each line is decoded independently to handle esp-coredump's per-line padding format.
+ * Returns the concatenated binary data, or undefined if no valid base64 found.
+ */
+function decodeBase64Payload(text: string): Buffer | undefined {
+  let content = text;
+
+  // If markers are present, extract only the content between them
+  const startMatch = COREDUMP_START_RE.exec(content);
+  const endMatch = COREDUMP_END_RE.exec(content);
+  if (startMatch && endMatch && endMatch.index > startMatch.index) {
+    content = content.slice(startMatch.index + startMatch[0].length, endMatch.index);
+  }
+
+  // Filter to only valid base64 lines (ignore empty lines, markers, and other output)
+  const base64Lines = content
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && /^[A-Za-z0-9+/=]+$/.test(l));
+
+  if (base64Lines.length === 0) {
+    return undefined;
+  }
+
+  // Decode each line independently — esp-coredump pads each line separately
+  const buffers = base64Lines.map(line => Buffer.from(line, 'base64'));
+  const binary = Buffer.concat(buffers);
+
+  // esp-coredump wraps the ELF core with a proprietary header (total_len, version, etc.).
+  // Strip it by locating the embedded ELF magic.
+  const elfOffset = binary.indexOf(ELF_MAGIC);
+  if (elfOffset === 0) {
+    return binary;
+  }
+  if (elfOffset > 0) {
+    return binary.subarray(elfOffset);
+  }
+  // No ELF magic found — not a valid coredump
+  return undefined;
+}
+
+/**
+ * Internal coredump decode — expects an actual ELF file path.
+ */
+async function decodeCoredumpElfInternal(
+  coredumpPath: string,
+  elfPath: string,
+  toolPath?: string,
+  targetArch?: string,
+  log?: DecodeLogger,
+): Promise<CoredumpDecodedResult> {
+  const write = (msg: string) => log?.appendLine(msg);
+
+  // Detect the architecture from the firmware ELF when not explicitly configured
+  const detectedArch = await detectElfArch(elfPath, log);
+  const crashKind: 'xtensa' | 'riscv' | 'unknown' = detectedArch ?? 'unknown';
+  write(`[ESP Decoder] Coredump: firmware ELF arch detection = ${detectedArch ?? 'unknown'}`);
+
+  let chosenArch: 'xtensa' | 'riscv' | 'unknown' = crashKind;
+  if (!toolPath) {
+    // Use the detected architecture to pick the right GDB
+    const primaryKind = crashKind === 'xtensa' ? 'xtensa' : crashKind === 'riscv' ? 'riscv' : 'riscv';
+    const fallbackKind = primaryKind === 'riscv' ? 'xtensa' : 'riscv';
+    toolPath = autoDetectPioToolPath(primaryKind, log);
+    if (toolPath) {
+      chosenArch = primaryKind;
+    } else {
+      toolPath = autoDetectPioToolPath(fallbackKind, log);
+      if (toolPath) {
+        chosenArch = fallbackKind;
+      }
+    }
+    if (!toolPath) {
+      write('[ESP Decoder] No toolPath (GDB) found for coredump decoding');
+      return {
+        threads: [],
+        rawOutput: 'No GDB toolchain found. Please configure a tool path.',
+      };
+    }
+  }
+
+  const resolvedArch = resolveTargetArch(targetArch, chosenArch);
+
+  try {
+    // Create decode params with coredumpMode enabled
+    let params: any;
+    try {
+      params = await createDecodeParams({
+        elfPath,
+        toolPath,
+        targetArch: resolvedArch as any,
+        coredumpMode: true,
+      });
+    } catch (e) {
+      write(`[ESP Decoder] createDecodeParams (coredump) failed: ${e instanceof Error ? e.message : String(e)}`);
+      params = { elfPath, toolPath, targetArch: resolvedArch, coredumpMode: true };
+    }
+
+    const decodeOptions: DecodeOptions = {};
+
+    // Pass the coredump file path as DecodeInputFileSource
+    const result = await decode(params, { inputPath: coredumpPath }, decodeOptions);
+
+    // Get stringified output for rawOutput
+    let rawOutput: string;
+    try {
+      rawOutput = stringifyDecodeResult(result, { color: 'disable' });
+    } catch {
+      rawOutput = '';
+    }
+
+    // Convert CoredumpDecodeResult (ThreadDecodeResult[]) to our format
+    if (Array.isArray(result)) {
+      if (result.length === 0) {
+        return { threads: [], rawOutput };
+      }
+      const threads: ThreadDecodedCrash[] = result.map((threadResult: any) => {
+        const decoded = convertDecodeResult(threadResult.result ?? threadResult, '');
+        return {
+          threadId: threadResult.threadId ?? 'unknown',
+          threadName: threadResult.threadName,
+          isCurrent: threadResult.current ?? false,
+          decoded,
+        };
+      });
+
+      return { threads, rawOutput };
+    }
+
+    // Non-array result (single thread / fallback)
+    const decoded = convertDecodeResult(result, '');
+    return {
+      threads: [{ threadId: '0', isCurrent: true, decoded }],
+      rawOutput,
+    };
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.stack || err.message : String(err);
+    write(`[ESP Decoder] coredump decode failed: ${errMsg}`);
+    return {
+      threads: [],
+      rawOutput: `Coredump decode failed: ${errMsg}`,
+    };
+  }
+}
+
+/**
  * Try to auto-detect a GDB binary from the local PlatformIO packages directory.
  * This is used as a fallback when no toolPath is configured in the extension settings.
  *
@@ -454,6 +788,9 @@ function autoDetectPioToolPath(
 
   // Xtensa — try common variants
   const xtensaVariants = [
+    { pkg: 'tool-xtensa-esp-elf-gdb',     bin: `xtensa-esp32-elf-gdb${ext}` },
+    { pkg: 'tool-xtensa-esp-elf-gdb',     bin: `xtensa-esp32s3-elf-gdb${ext}` },
+    { pkg: 'tool-xtensa-esp-elf-gdb',     bin: `xtensa-esp32s2-elf-gdb${ext}` },
     { pkg: 'toolchain-xtensa-esp-elf',    bin: `xtensa-esp-elf-gdb${ext}` },
     { pkg: 'toolchain-xtensa-esp32s3-elf', bin: `xtensa-esp32s3-elf-gdb${ext}` },
     { pkg: 'toolchain-xtensa-esp32-elf',   bin: `xtensa-esp32-elf-gdb${ext}` },
@@ -468,9 +805,15 @@ function autoDetectPioToolPath(
   try {
     for (const entry of fs.readdirSync(pioPackagesDir)) {
       if (entry.startsWith('tool-xtensa') && entry.includes('-gdb')) {
-        const binName = entry.replace(/^tool-/, '') + ext;
-        const c = path.join(pioPackagesDir, entry, 'bin', binName);
-        if (fs.existsSync(c)) { return c; }
+        const binDir = path.join(pioPackagesDir, entry, 'bin');
+        try {
+          for (const bin of fs.readdirSync(binDir)) {
+            if (bin.match(/^xtensa-.*-elf-gdb(\.exe)?$/)) {
+              const c = path.join(binDir, bin);
+              if (fs.existsSync(c)) { return c; }
+            }
+          }
+        } catch { /* bin dir unreadable */ }
       }
     }
   } catch { /* ignore */ }
@@ -483,6 +826,45 @@ function autoDetectPioToolPath(
  * Valid trbr target architectures.
  */
 const VALID_TRBR_TARGETS = ['xtensa', 'esp32c2', 'esp32c3', 'esp32c6', 'esp32h2', 'esp32h4', 'esp32p4'] as const;
+
+/** ELF e_machine values for ESP chip families */
+const ELF_MACHINE_XTENSA = 0x5e; // 94
+const ELF_MACHINE_RISCV = 0xf3;  // 243
+
+/**
+ * Detect the architecture from a firmware ELF file's e_machine header field.
+ * Returns 'xtensa' or 'riscv', or undefined if detection fails.
+ */
+async function detectElfArch(
+  elfPath: string,
+  log?: DecodeLogger,
+): Promise<'xtensa' | 'riscv' | undefined> {
+  try {
+    const fd = await fsPromises.open(elfPath, 'r');
+    try {
+      const header = Buffer.alloc(20);
+      const { bytesRead } = await fd.read(header, 0, 20, 0);
+      if (bytesRead < 20) { return undefined; }
+
+      // Verify ELF magic
+      if (header[0] !== 0x7f || header[1] !== 0x45 || header[2] !== 0x4c || header[3] !== 0x46) {
+        return undefined;
+      }
+
+      // e_machine is at offset 18, little-endian uint16
+      const machine = header.readUInt16LE(18);
+      if (machine === ELF_MACHINE_XTENSA) { return 'xtensa'; }
+      if (machine === ELF_MACHINE_RISCV) { return 'riscv'; }
+
+      log?.appendLine(`[ESP Decoder] Unknown ELF e_machine: 0x${machine.toString(16)}`);
+      return undefined;
+    } finally {
+      await fd.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Resolve the target architecture from config and crash kind.
